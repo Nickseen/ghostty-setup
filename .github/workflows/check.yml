@@ -4,7 +4,7 @@ permissions:
   contents: read
 jobs:
   configs-and-helpers:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Shell syntax
@@ -14,7 +14,7 @@ jobs:
       - name: Preview install destinations
         run: python3 setup.py install --full --dry-run
   native-tmux:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
