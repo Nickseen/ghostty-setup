@@ -127,6 +127,26 @@ def output(args, timeout=5):
         return None
 
 
+def no_color_scopes(command):
+    """Inspect only NO_COLOR, never dump a server's potentially secret environment."""
+    scopes = []
+    sessions = output(command + ['list-sessions', '-F', '#{session_id}'])
+    if sessions is None:
+        return scopes
+    for label, flags in [('server', ['-g'])] + [
+            (session, ['-t', session]) for session in sessions.splitlines()]:
+        value = output(command + ['show-environment'] + flags + ['NO_COLOR'])
+        if value and value.startswith('NO_COLOR=') and value != 'NO_COLOR=':
+            scopes.append((label, flags))
+    return scopes
+
+
+def repair_colors(command):
+    # Existing shells/clients keep their own environment and must be reopened.
+    for _, flags in no_color_scopes(command):
+        run(command + ['set-environment'] + flags + ['-u', 'NO_COLOR'])
+
+
 def doctor(args):
     home, warnings = Path.home(), []
     def report(ok, text):
@@ -170,6 +190,10 @@ def doctor(args):
         balanced = output([home / '.local/bin/tmux-balanced', 'display-message', '-p', '#{version}'])
         if balanced:
             report(balanced == VERSIONS['tmux_private'], 'isolated balanced server: ' + balanced)
+            disabled = no_color_scopes([home / '.local/bin/tmux-balanced'])
+            report(not disabled, 'managed tmux color environment' +
+                   ('; NO_COLOR disables colors AND image previews; run ghostty-setup repair --colors, then reopen affected shells/Codex'
+                    if disabled else ''))
         else:
             print('INFO start the updated server with: tmux-balanced new -A -s myproject')
         legacy = output([brew_binary('tmux'), '-L', 'default', 'display-message', '-p', '#{version}'])
@@ -187,7 +211,11 @@ def repair(args):
         command = [brew_binary('tmux'), '-L', socket]
         if output(command + ['list-sessions']) is not None:
             run(command + ['set-option', '-g', 'allow-passthrough', 'all'])
+            if args.colors:
+                repair_colors(command)
     print('Launchers and graphics repaired; no running task stopped.')
+    if args.colors:
+        print('NO_COLOR cleared from tmux environments. Reopen affected shells/Codex; existing processes retain their old environment.')
     doctor(argparse.Namespace(strict=False))
 
 
@@ -223,7 +251,9 @@ def main():
         p.add_argument('--' + flag, action='store_true')
     p.set_defaults(func=install)
     p = sub.add_parser('doctor');p.add_argument('--strict', action='store_true');p.set_defaults(func=doctor)
-    p = sub.add_parser('repair');p.set_defaults(func=repair)
+    p = sub.add_parser('repair')
+    p.add_argument('--colors', action='store_true', help='clear NO_COLOR from tmux server/session environments')
+    p.set_defaults(func=repair)
     p = sub.add_parser('restore');p.add_argument('backup');p.set_defaults(func=restore)
     p = sub.add_parser('build');p.add_argument('component', choices=['tmux', 'broot', 'codex'])
     p.set_defaults(func=lambda a: build(a.component, True))

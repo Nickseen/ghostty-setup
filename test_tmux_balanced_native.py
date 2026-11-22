@@ -12,6 +12,7 @@ import subprocess
 import termios
 import time
 import unittest
+import setup
 
 BINARY = Path(__file__).parent / '.build/tmux-3.8/tmux'
 
@@ -292,6 +293,39 @@ class NativeResizeTests(unittest.TestCase):
             self.assertTrue(c.run('show-buffer').startswith('abc'))
             c.run('resize-pane', '-t', c.pane, '-x', '45')
             self.assertEqual(c.sizes(), [45, 25, 50])
+
+
+class ColorEnvironmentTests(unittest.TestCase):
+    def test_repair_removes_inherited_no_color_for_future_panes_only(self):
+        base = [str(BINARY), '-L', 'color-env-test-' + str(os.getpid()), '-f', '/dev/null']
+        # Reproduce a server started by an automation whose own logs disable ANSI.
+        env = dict(os.environ, NO_COLOR='1')
+        job = '/bin/sh -c ' + shlex.quote('printf "NO_COLOR=%s\\n" "${NO_COLOR-unset}"; exec /bin/sleep 90')
+        def call(*args):
+            return subprocess.check_output(base + list(args), text=True, env=env).strip()
+        try:
+            original = call('new-session', '-dP', '-F', '#{pane_id}', '-s', 'colors', job)
+            call('set-environment', '-t', 'colors', 'NO_COLOR', '1')
+            call('set-environment', '-g', 'COLOR_TEST_SENTINEL', 'untouched')
+            self.assertEqual([label for label, _ in setup.no_color_scopes(base)], ['server', '$0'])
+            setup.repair_colors(base)
+            self.assertEqual(setup.no_color_scopes(base), [])
+            self.assertEqual(call('show-environment', '-g', 'COLOR_TEST_SENTINEL'), 'COLOR_TEST_SENTINEL=untouched')
+            fresh = call('split-window', '-dP', '-F', '#{pane_id}', '-t', original, job)
+            for _ in range(50):
+                old_text = call('capture-pane', '-p', '-t', original)
+                new_text = call('capture-pane', '-p', '-t', fresh)
+                if 'NO_COLOR=1' in old_text and 'NO_COLOR=unset' in new_text:
+                    break
+                time.sleep(.02)
+            self.assertIn('NO_COLOR=1', old_text)
+            self.assertIn('NO_COLOR=unset', new_text)
+            # An empty value doesn't disable ANSI and should remain intentional.
+            call('set-environment', '-t', 'colors', 'NO_COLOR', '')
+            setup.repair_colors(base)
+            self.assertEqual(call('show-environment', '-t', 'colors', 'NO_COLOR'), 'NO_COLOR=')
+        finally:
+            subprocess.run(base + ['kill-server'], capture_output=True)
 
 
 if __name__ == '__main__':
