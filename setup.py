@@ -183,7 +183,7 @@ def doctor(args):
 
 def repair(args):
     install_launchers()
-    for socket in set(['default', 'balanced', VERSIONS['tmux_socket']]):
+    for socket in set(['default', 'balanced', 'balanced-v2', VERSIONS['tmux_socket']]):
         command = [brew_binary('tmux'), '-L', socket]
         if output(command + ['list-sessions']) is not None:
             run(command + ['set-option', '-g', 'allow-passthrough', 'all'])
