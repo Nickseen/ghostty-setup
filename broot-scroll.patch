@@ -1,0 +1,119 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,6 +18,7 @@
+ pub mod hex;
+ pub mod icon;
+ pub mod image;
++pub mod input_events;
+ pub mod keys;
+ pub mod kitty;
+ pub mod launchable;
+--- a/src/app/app.rs
++++ b/src/app/app.rs
+@@ -13,6 +13,7 @@
+         file_sum,
+         git,
+         graphics,
++        input_events::{EventSource, EventSourceOptions},
+         launchable::Launchable,
+         path::closest_dir,
+         pattern::InputPattern,
+@@ -27,7 +28,7 @@
+         verb::Internal,
+         watcher::Watcher,
+     },
+-    crokey::crossterm::event::Event,
++    crokey::crossterm::event::{Event, MouseEvent, MouseEventKind},
+     std::{
+         io::Write,
+         path::PathBuf,
+@@ -38,8 +39,6 @@
+         },
+     },
+     termimad::{
+-        EventSource,
+-        EventSourceOptions,
+         crossbeam::channel::{
+             Receiver,
+             Sender,
+@@ -558,7 +557,9 @@
+                 }
+             }
+             let event = dam.next(&self.rx_seqs);
+-            if app_state.watch_tree {
++            let wheel = matches!(&event, Either::First(Some(event)) if matches!(event.event,
++                Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp | MouseEventKind::ScrollDown, .. })));
++            if app_state.watch_tree && !wheel {
+                 // we must unwatch before applying the command, as it will probably do many system
+                 // calls that would trigger events
+                 self.watcher.stop_watching()?;
+@@ -588,7 +589,21 @@
+ 
+                     // event handled by the panel
+                     if !handled {
+-                        let cmd = self.panels.on_input_event(w, &event, &app_state, con)?;
++                        let mut cmd = self.panels.on_input_event(w, &event, &app_state, con)?;
++                        if wheel {
++                            if let Command::Internal { internal, input_invocation } = &mut cmd {
++                                *internal = match *internal {
++                                    Internal::line_down => Internal::line_down_no_cycle,
++                                    Internal::line_up => Internal::line_up_no_cycle,
++                                    other => other,
++                                };
++                                *input_invocation = Some(crate::verb::VerbInvocation {
++                                    name: internal.name().to_string(),
++                                    args: Some(event.scroll_steps.to_string()),
++                                    bang: false,
++                                });
++                            }
++                        }
+                         info!("command from panels.on_input_event: {:#?}", cmd);
+                         self.apply_command(w, &cmd, &skin.focused, &mut app_state, con)?;
+                     }
+--- a/src/task_sync.rs
++++ b/src/task_sync.rs
+@@ -1,7 +1,7 @@
+ use {
+     std::thread,
++    crate::input_events::TimedEvent,
+     termimad::{
+-        TimedEvent,
+         crossbeam::channel::{
+             self,
+             Receiver,
+--- a/src/watcher.rs
++++ b/src/watcher.rs
+@@ -96,6 +96,9 @@
+         &mut self,
+         paths: Vec<PathBuf>,
+     ) -> Result<(), ProgramError> {
++        if self.watched == paths && self.notify_watcher.is_some() {
++            return Ok(());
++        }
+         debug!("start watching new paths");
+         let notify_watcher = match self.notify_watcher.as_mut() {
+             Some(nw) => {
+--- a/src/browser/browser_state.rs
++++ b/src/browser/browser_state.rs
+@@ -229,8 +229,19 @@
+     fn watchable_paths(&self) -> Vec<PathBuf> {
+         let mut paths = Vec::new();
+         for line in &self.tree.lines {
+-            paths.push(line.path.clone());
+-        }
++            // A directory watch already includes changes to its immediate files.
++            // Hundreds of separate file watches make FSEvents re-arming very slow.
++            let path = if line.line_type == TreeLineType::Dir {
++                Some(line.path.as_path())
++            } else {
++                line.path.parent()
++            };
++            if let Some(path) = path {
++                paths.push(path.to_path_buf());
++            }
++        }
++        paths.sort_unstable();
++        paths.dedup();
+         paths
+     }
+ 

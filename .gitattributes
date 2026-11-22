@@ -1,0 +1,3 @@
+* text=auto
+# A unified diff uses a literal single-space context line; preserve its payload.
+*.patch -whitespace

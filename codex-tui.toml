@@ -1,0 +1,5 @@
+# Appearance only. Login, models, projects and MCP configuration stay personal.
+[tui]
+theme = "catppuccin-mocha"
+alternate_screen = "always"
+status_line = ["context-used", "context-window-size", "used-tokens", "five-hour-limit", "model-with-reasoning"]

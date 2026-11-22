@@ -1,0 +1,23 @@
+name: Setup checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  configs-and-helpers:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: for script in *.zsh *.sh; do zsh -n "$script"; done
+      - name: Portable installation and file operations
+        run: python3 -m unittest -v test_setup test_broot_actions test_broot_file_import.FileImportTests
+      - name: Preview install destinations
+        run: python3 setup.py install --full --dry-run
+  native-tmux:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: brew install libevent ncurses utf8proc jemalloc pkgconf
+      - name: Build pinned tmux and exercise real mouse input
+        run: zsh build-tmux-balanced.zsh

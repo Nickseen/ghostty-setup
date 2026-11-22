@@ -1,0 +1,11 @@
+--- a/src/display/displayable_tree.rs
++++ b/src/display/displayable_tree.rs
+@@ -494,7 +494,7 @@
+             tree.disclosure_hits.borrow_mut().clear();
+         }
+         let total_size = tree.total_sum();
+-        let scrollbar = if self.in_app {
++        let scrollbar = if self.in_app && std::env::var_os("BROOT_HIDE_SCROLLBAR").is_none() {
+             termimad::compute_scrollbar(
+                 tree.scroll,
+                 tree.lines.len() - 1, // the root line isn't scrolled

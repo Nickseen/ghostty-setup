@@ -1,0 +1,651 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index ddddc61..70a7ba4 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -73,6 +73,9 @@ use crate::multi_agents::next_agent_shortcut_matches;
+ use crate::multi_agents::previous_agent_shortcut_matches;
+ use crate::multi_agents::sub_agent_activity_display;
+ use crate::pager_overlay::Overlay;
++#[cfg(test)]
++#[path = "app/image_click_preview_tests.rs"]
++mod image_click_preview_tests;
+ use crate::render::highlight::highlight_bash_to_lines;
+ use crate::render::renderable::Renderable;
+ use crate::resume_picker::SessionSelection;
+diff --git a/codex-rs/tui/src/app/history_ui.rs b/codex-rs/tui/src/app/history_ui.rs
+index ac38f11..2409bf5 100644
+--- a/codex-rs/tui/src/app/history_ui.rs
++++ b/codex-rs/tui/src/app/history_ui.rs
+@@ -295,12 +295,28 @@ impl App {
+     }
+ 
+     pub(super) fn open_url_in_browser(&mut self, url: String) {
++        if let Ok(parsed) = url::Url::parse(&url)
++            && parsed.scheme() == "file"
++            && let Ok(path) = parsed.to_file_path()
++            && crate::terminal_hyperlinks::TerminalHyperlink::viewed_image(0..1, &path).is_some()
++            && self.open_local_image_preview(path)
++        {
++            return;
++        }
+         if let Err(err) = webbrowser::open(&url) {
+             self.chat_widget
+                 .add_error_message(format!("Failed to open browser for {url}: {err}"));
+         }
+     }
+ 
++    pub(super) fn open_local_image_preview(&mut self, path: std::path::PathBuf) -> bool {
++        let Some(protocol) = self.chat_widget.pet_image_support().protocol() else {
++            return false;
++        };
++        self.overlay = Some(crate::pager_overlay::Overlay::new_image(path, protocol));
++        true
++    }
++
+     pub(super) fn open_desktop_thread(&mut self, thread_id: ThreadId) {
+         let url = format!("codex://threads/{thread_id}");
+         if let Err(err) = open_desktop_thread_url(&url) {
+diff --git a/codex-rs/tui/src/app/image_click_preview_tests.rs b/codex-rs/tui/src/app/image_click_preview_tests.rs
+new file mode 100644
+index 0000000..c68ed8c
+--- /dev/null
++++ b/codex-rs/tui/src/app/image_click_preview_tests.rs
+@@ -0,0 +1,115 @@
++//! Attachment hits resolve by painted coordinates, keep drafts intact, and never submit a turn.
++use super::*;
++use crate::history_cell::HistoryCell;
++use crate::pets::{ImageProtocol, PetImageSupport};
++use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn image_click_preview_thumbnail_and_draft_label_preserve_input() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let path = dir.path().join("sample.png");
++    image::RgbaImage::from_pixel(800, 600, image::Rgba([23, 99, 210, 255])).save(&path)?;
++    let mut app = crate::app::test_support::make_test_app().await;
++    app.chat_widget
++        .set_pet_image_support_for_tests(PetImageSupport::Supported(ImageProtocol::Kitty));
++    app.chat_widget.handle_paste("Описание: ".into());
++    app.chat_widget
++        .attach_image(path.clone(), ClipboardPasteContext::DraftHandoff);
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    tui.set_owned_screen(true)?;
++    let size = ratatui::layout::Size::new(80, 24);
++    tui.terminal.resize(size)?;
++    app.render_owned_transcript(&mut tui, size)?;
++    let before = app.chat_widget.capture_thread_input_state();
++    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
++    let label = buffer
++        .area
++        .positions()
++        .find(|pos| {
++            pos.x + 1 < buffer.area.right()
++                && buffer[*pos].symbol() == "["
++                && buffer[(pos.x + 1, pos.y)].symbol() == "I"
++        })
++        .expect("image label is painted");
++    let thumbnail = tui.retained_images.first().expect("thumbnail painted").area;
++    for position in [(thumbnail.x, thumbnail.y), (label.x + 2, label.y)] {
++        assert!(app.preview_composer_image(MouseEvent {
++            kind: MouseEventKind::Down(MouseButton::Left),
++            column: position.0,
++            row: position.1,
++            modifiers: KeyModifiers::NONE,
++        }));
++        let overlay = app.overlay.as_mut().expect("image overlay opened");
++        overlay.handle_event(&mut tui, TuiEvent::Draw)?;
++        let large = tui
++            .retained_images
++            .first()
++            .expect("full size image painted");
++        assert!(large.area.width > thumbnail.width * 3);
++        assert!(large.area.height > thumbnail.height * 3);
++        overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Esc.into()))?;
++        assert!(overlay.is_done());
++        app.close_transcript_overlay(&mut tui);
++        assert_eq!(app.chat_widget.capture_thread_input_state(), before);
++        app.render_owned_transcript(&mut tui, size)?;
++    }
++    assert!(!app.preview_composer_image(MouseEvent {
++        kind: MouseEventKind::Down(MouseButton::Left),
++        column: label.x,
++        row: label.y,
++        modifiers: KeyModifiers::SHIFT,
++    }));
++    Ok(())
++}
++
++#[tokio::test]
++async fn image_click_preview_sent_labels_open_their_own_attachment() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let paths: Vec<_> = ["one.png", "two.png"]
++        .into_iter()
++        .map(|name| dir.path().join(name))
++        .collect();
++    for path in &paths {
++        image::RgbaImage::new(10, 10).save(path)?;
++    }
++    let message = "Привет [Image #1] и [Image #2]".to_string();
++    let text_elements = ["[Image #1]", "[Image #2]"]
++        .into_iter()
++        .map(|label| {
++            let start = message.find(label).expect("attachment label");
++            codex_protocol::user_input::TextElement::new(
++                (start..start + label.len()).into(),
++                Some(label.to_string()),
++            )
++        })
++        .collect();
++    let cell = crate::history_cell::UserHistoryCell {
++        message,
++        text_elements,
++        local_image_paths: paths.clone(),
++        remote_image_urls: Vec::new(),
++        presentation: Default::default(),
++    };
++    let links: Vec<_> = cell
++        .transcript_hyperlink_lines(90)
++        .into_iter()
++        .flat_map(|line| line.hyperlinks)
++        .collect();
++    assert_eq!(links.len(), 2);
++    let mut app = crate::app::test_support::make_test_app().await;
++    app.chat_widget
++        .set_pet_image_support_for_tests(PetImageSupport::Supported(ImageProtocol::Kitty));
++    for (link, path) in links.iter().zip(paths) {
++        assert_eq!(
++            url::Url::parse(&link.destination)?.to_file_path().ok(),
++            Some(path.canonicalize()?)
++        );
++        app.open_url_in_browser(link.destination.clone());
++        assert!(matches!(
++            app.overlay.take(),
++            Some(crate::pager_overlay::Overlay::Image(_))
++        ));
++    }
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/owned_transcript.rs b/codex-rs/tui/src/app/owned_transcript.rs
+index 37e406c..f20fa13 100644
+--- a/codex-rs/tui/src/app/owned_transcript.rs
++++ b/codex-rs/tui/src/app/owned_transcript.rs
+@@ -140,6 +140,22 @@ impl PreparedConversation {
+ }
+ 
+ impl App {
++    /// Use the last painted geometry so a click opens precisely that local attachment.
++    pub(super) fn preview_composer_image(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
++        if !self.chat_widget.no_modal_or_popup_active()
++            || mouse.kind != MouseEventKind::Down(MouseButton::Left)
++            || !mouse.modifiers.is_empty()
++        {
++            return false;
++        }
++        let path = self
++            .chat_widget
++            .composer_images
++            .as_ref()
++            .and_then(|images| images.image_at(mouse.column, mouse.row))
++            .or_else(|| self.chat_widget.local_image_at_mouse(mouse));
++        path.is_some_and(|path| self.open_local_image_preview(path))
++    }
+     /// Copy draft selections before key shortcuts, or after mouse layout has been refreshed.
+     pub(super) fn handle_composer_copy_event(
+         &mut self,
+@@ -904,6 +920,10 @@ impl App {
+                     return Ok(true);
+                 }
+             }
++            if self.preview_composer_image(*mouse) {
++                tui.frame_requester().schedule_frame();
++                return Ok(true);
++            }
+             if self.chat_widget.no_modal_or_popup_active()
+                 && self
+                     .chat_widget
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index db3b79f..c87abe7 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -273,8 +273,9 @@
+ //!
+ //! Submission flushes expired characters and buffers before classifying Enter, independent of
+ //! UI flush ticks. `disable_paste_burst` bypasses detection; setting it flushes and clears in-flight state.
+-//! Mouse edits flush pending typing; selection and copy behavior lives in [`mouse`]. Confirmed
+-//! explicit copies clear the selection while preserving the draft and cursor. Footer text uses a separate
++//! Mouse edits flush pending typing; selection and copy behavior lives in [`mouse`].
++//! A plain click on a local image element opens its large preview without editing the draft.
++//! Confirmed explicit copies clear the selection while preserving the draft and cursor. Footer text uses a separate
+ //! read-only selection owner over its final rendered cells.
+ //!
+ //! See `codex-rs/tui/src/bottom_pane/paste_burst.rs` for the detailed state machine.
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/mouse.rs b/codex-rs/tui/src/bottom_pane/chat_composer/mouse.rs
+index e706fec..2aa151e 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/mouse.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/mouse.rs
+@@ -23,6 +23,17 @@ pub(crate) enum ClipboardPasteTarget {
+ }
+ 
+ impl ChatComposer {
++    pub(crate) fn local_image_at_mouse(&self, event: MouseEvent) -> Option<std::path::PathBuf> {
++        let label = self
++            .draft
++            .textarea
++            .element_at_mouse(event, *self.draft.textarea_state.borrow())?;
++        self.attachments
++            .local_images
++            .iter()
++            .find(|image| image.placeholder == label)
++            .map(|image| image.path.clone())
++    }
+     pub(crate) fn clipboard_paste_target(
+         &self,
+         shortcut: Option<KeyCode>,
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index a165ca1..d479d6b 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -2036,6 +2036,16 @@ impl BottomPane {
+         self.composer.handle_mouse(event)
+     }
+ 
++    pub(crate) fn local_image_at_mouse(
++        &self,
++        event: crossterm::event::MouseEvent,
++    ) -> Option<std::path::PathBuf> {
++        if !self.no_modal_or_popup_active() {
++            return None;
++        }
++        self.composer.local_image_at_mouse(event)
++    }
++
+     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
+         self.push_view(view);
+     }
+diff --git a/codex-rs/tui/src/bottom_pane/textarea/mouse.rs b/codex-rs/tui/src/bottom_pane/textarea/mouse.rs
+index 01fdfc7..2355862 100644
+--- a/codex-rs/tui/src/bottom_pane/textarea/mouse.rs
++++ b/codex-rs/tui/src/bottom_pane/textarea/mouse.rs
+@@ -19,6 +19,27 @@ pub(super) struct MouseSelection {
+ }
+ 
+ impl TextArea {
++    /// Resolve the element under an actual rendered cell; padding is never an attachment target.
++    pub(in crate::bottom_pane) fn element_at_mouse(
++        &self,
++        event: MouseEvent,
++        state: TextAreaState,
++    ) -> Option<&str> {
++        if !self.contains_mouse(event) {
++            return None;
++        }
++        let area = self.rendered_area.get();
++        let lines = self.wrapped_lines(area.width);
++        let row = state.scroll + usize::from(event.row.saturating_sub(area.y));
++        let line = lines.get(row)?;
++        let pos = self.position_at_display_col_on_line(
++            line.start,
++            line.end - 1,
++            usize::from(event.column.saturating_sub(area.x)),
++        );
++        let element = self.elements.iter().find(|e| e.range.contains(&pos))?;
++        self.text().get(element.range.clone())
++    }
+     pub(in crate::bottom_pane) fn defer_copy(&mut self, id: u64) {
+         if let Some(range) = self.mouse_selection_range()
+             && let Some(selection) = &mut self.mouse_selection
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index db5d2d8..490f21c 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -62,6 +62,13 @@ impl ChatWidget {
+         self.bottom_pane.handle_composer_mouse(event)
+     }
+ 
++    pub(crate) fn local_image_at_mouse(
++        &self,
++        event: crossterm::event::MouseEvent,
++    ) -> Option<std::path::PathBuf> {
++        self.bottom_pane.local_image_at_mouse(event)
++    }
++
+     /// Snapshot the paste target without changing pending submissions. Unlike mouse paste,
+     /// a keyboard paste may replace a composer selection or complete an active popup.
+     pub(crate) fn clipboard_paste_target(
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index 84f5a86..df4a810 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -330,6 +330,26 @@ impl HistoryCell for UserHistoryCell {
+             source.right_reserve = 1;
+             source.copy_as_prose |= copy_as_prose;
+         }
++        for line in &mut lines {
++            let text: String = line
++                .line
++                .spans
++                .iter()
++                .map(|span| span.content.as_ref())
++                .collect();
++            for (index, path) in self.local_image_paths.iter().enumerate() {
++                let label = local_image_label_text(self.remote_image_urls.len() + index + 1);
++                for (start, _) in text.match_indices(&label) {
++                    let column = unicode_width::UnicodeWidthStr::width(&text[..start]);
++                    if let Some(link) = crate::terminal_hyperlinks::TerminalHyperlink::viewed_image(
++                        column..column + label.len(),
++                        path,
++                    ) {
++                        line.hyperlinks.push(link);
++                    }
++                }
++            }
++        }
+         lines
+     }
+ 
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+index 6f0d2f4..4c89c7e 100644
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -3,6 +3,7 @@
+ //! Static content retains its generic pager. Transcript previews share the main conversation
+ //! viewport, including its scrolling, selection, search and bounded text layouts.
+ 
++mod image_preview;
+ mod scrolling;
+ mod transcript;
+ 
+@@ -42,12 +43,19 @@ use ratatui::widgets::Wrap;
+ use scrolling::render_offset_content;
+ 
+ pub(crate) enum Overlay {
++    Image(image_preview::ImagePreview),
+     Transcript(TranscriptOverlay),
+     Static(StaticOverlay),
+     Analytics(Box<crate::analytics::AnalyticsView>),
+ }
+ 
+ impl Overlay {
++    pub(crate) fn new_image(
++        path: std::path::PathBuf,
++        protocol: crate::pets::ImageProtocol,
++    ) -> Self {
++        Self::Image(image_preview::ImagePreview::new(path, protocol))
++    }
+     pub(crate) fn new_transcript(
+         cells: Vec<Arc<dyn HistoryCell>>,
+         keymap: PagerKeymap,
+@@ -86,11 +94,14 @@ impl Overlay {
+ 
+     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+         let mouse_capture = match self {
+-            Overlay::Transcript(_) | Overlay::Analytics(_) => tui::MouseCapture::Enabled,
++            Overlay::Transcript(_) | Overlay::Analytics(_) | Overlay::Image(_) => {
++                tui::MouseCapture::Enabled
++            }
+             Overlay::Static(_) => tui::MouseCapture::Disabled,
+         };
+         tui.set_mouse_capture(mouse_capture)?;
+         let result = match self {
++            Overlay::Image(o) => o.handle_event(tui, event),
+             Overlay::Transcript(o) => o.handle_event(tui, event).map(drop),
+             Overlay::Static(o) => o.handle_event(tui, event),
+             Overlay::Analytics(o) => o.handle_event(tui, event),
+@@ -104,6 +115,7 @@ impl Overlay {
+ 
+     pub(crate) fn is_done(&self) -> bool {
+         match self {
++            Overlay::Image(o) => o.is_done,
+             Overlay::Transcript(o) => o.is_done(),
+             Overlay::Static(o) => o.is_done(),
+             Overlay::Analytics(o) => o.is_done,
+diff --git a/codex-rs/tui/src/pager_overlay/image_preview.rs b/codex-rs/tui/src/pager_overlay/image_preview.rs
+new file mode 100644
+index 0000000..510e9c0
+--- /dev/null
++++ b/codex-rs/tui/src/pager_overlay/image_preview.rs
+@@ -0,0 +1,80 @@
++//! A local attachment opens above the conversation without changing its draft or scroll position.
++use std::path::PathBuf;
++use std::sync::Arc;
++
++use crossterm::event::{KeyCode, KeyEventKind};
++use ratatui::layout::Rect;
++use ratatui::style::{Color, Style};
++use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
++
++use crate::pets::ImageProtocol;
++use crate::transcript_image::{ImagePlacement, TranscriptImage};
++use crate::tui::{Tui, TuiEvent};
++
++pub(crate) struct ImagePreview {
++    path: PathBuf,
++    protocol: ImageProtocol,
++    cached: Option<(Rect, Option<Arc<TranscriptImage>>)>,
++    pub(crate) is_done: bool,
++}
++
++impl ImagePreview {
++    pub(crate) fn new(path: PathBuf, protocol: ImageProtocol) -> Self {
++        Self {
++            path,
++            protocol,
++            cached: None,
++            is_done: false,
++        }
++    }
++
++    pub(crate) fn handle_event(&mut self, tui: &mut Tui, event: TuiEvent) -> std::io::Result<()> {
++        match event {
++            TuiEvent::Key(key) if key.kind != KeyEventKind::Release => {
++                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
++                    self.is_done = true;
++                }
++            }
++            TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume | TuiEvent::FocusGained => {
++                tui.draw(u16::MAX, |frame| {
++                    let area = frame.area();
++                    Clear.render(area, frame.buffer);
++                    let title = self.path.file_name().unwrap_or_default().to_string_lossy();
++                    let block = Block::default()
++                        .borders(Borders::ALL)
++                        .border_style(Style::default().fg(Color::Cyan))
++                        .title(format!(" {title} "))
++                        .title_bottom(" Esc / Enter — вернуться в чат ");
++                    let inner = block.inner(area);
++                    block.render(area, frame.buffer);
++                    if self.cached.as_ref().is_none_or(|(old, _)| *old != inner) {
++                        self.cached = Some((
++                            inner,
++                            TranscriptImage::load_large(&self.path, inner, self.protocol)
++                                .map(Arc::new),
++                        ));
++                    }
++                    if let Some((_, Some(image))) = &self.cached {
++                        let bounds = Rect::new(
++                            inner.x + inner.width.saturating_sub(image.columns) / 2,
++                            inner.y + inner.height.saturating_sub(image.rows) / 2,
++                            image.columns.min(inner.width),
++                            image.rows.min(inner.height),
++                        );
++                        frame.image_placements.push(ImagePlacement {
++                            image: Arc::clone(image),
++                            area: bounds,
++                            first_row: 0,
++                            file: None,
++                        });
++                    } else {
++                        Paragraph::new("Не удалось прочитать изображение")
++                            .render(inner, frame.buffer);
++                    }
++                })?;
++            }
++            _ => {}
++        }
++        Ok(())
++    }
++}
+diff --git a/codex-rs/tui/src/pets/image_protocol.rs b/codex-rs/tui/src/pets/image_protocol.rs
+index 38f387e..2fbea5d 100644
+--- a/codex-rs/tui/src/pets/image_protocol.rs
++++ b/codex-rs/tui/src/pets/image_protocol.rs
+@@ -21,6 +21,42 @@ use ratatui::layout::Rect;
+ 
+ use super::sixel;
+ 
++// Row encodings defined by the Kitty graphics protocol (Unicode data, not font glyphs).
++// https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
++const IMAGE_ROW_MARKS: &[char] = &[
++    '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}', '\u{033f}',
++    '\u{0346}', '\u{034a}', '\u{034b}', '\u{034c}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
++    '\u{035b}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
++    '\u{036a}', '\u{036b}', '\u{036c}', '\u{036d}', '\u{036e}', '\u{036f}', '\u{0483}', '\u{0484}',
++    '\u{0485}', '\u{0486}', '\u{0487}', '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}',
++    '\u{0598}', '\u{0599}', '\u{059c}', '\u{059d}', '\u{059e}', '\u{059f}', '\u{05a0}', '\u{05a1}',
++    '\u{05a8}', '\u{05a9}', '\u{05ab}', '\u{05ac}', '\u{05af}', '\u{05c4}', '\u{0610}', '\u{0611}',
++    '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
++    '\u{0659}', '\u{065a}', '\u{065b}', '\u{065d}', '\u{065e}', '\u{06d6}', '\u{06d7}', '\u{06d8}',
++    '\u{06d9}', '\u{06da}', '\u{06db}', '\u{06dc}', '\u{06df}', '\u{06e0}', '\u{06e1}', '\u{06e2}',
++    '\u{06e4}', '\u{06e7}', '\u{06e8}', '\u{06eb}', '\u{06ec}', '\u{0730}', '\u{0732}', '\u{0733}',
++    '\u{0735}', '\u{0736}', '\u{073a}', '\u{073d}', '\u{073f}', '\u{0740}', '\u{0741}', '\u{0743}',
++    '\u{0745}', '\u{0747}', '\u{0749}', '\u{074a}', '\u{07eb}', '\u{07ec}', '\u{07ed}', '\u{07ee}',
++    '\u{07ef}', '\u{07f0}', '\u{07f1}', '\u{07f3}', '\u{0816}', '\u{0817}', '\u{0818}', '\u{0819}',
++    '\u{081b}', '\u{081c}', '\u{081d}', '\u{081e}', '\u{081f}', '\u{0820}', '\u{0821}', '\u{0822}',
++    '\u{0823}', '\u{0825}', '\u{0826}', '\u{0827}', '\u{0829}', '\u{082a}', '\u{082b}', '\u{082c}',
++    '\u{082d}', '\u{0951}', '\u{0953}', '\u{0954}', '\u{0f82}', '\u{0f83}', '\u{0f86}', '\u{0f87}',
++    '\u{135d}', '\u{135e}', '\u{135f}', '\u{17dd}', '\u{193a}', '\u{1a17}', '\u{1a75}', '\u{1a76}',
++    '\u{1a77}', '\u{1a78}', '\u{1a79}', '\u{1a7a}', '\u{1a7b}', '\u{1a7c}', '\u{1b6b}', '\u{1b6d}',
++    '\u{1b6e}', '\u{1b6f}', '\u{1b70}', '\u{1b71}', '\u{1b72}', '\u{1b73}', '\u{1cd0}', '\u{1cd1}',
++    '\u{1cd2}', '\u{1cda}', '\u{1cdb}', '\u{1ce0}', '\u{1dc0}', '\u{1dc1}', '\u{1dc3}', '\u{1dc4}',
++    '\u{1dc5}', '\u{1dc6}', '\u{1dc7}', '\u{1dc8}', '\u{1dc9}', '\u{1dcb}', '\u{1dcc}', '\u{1dd1}',
++    '\u{1dd2}', '\u{1dd3}', '\u{1dd4}', '\u{1dd5}', '\u{1dd6}', '\u{1dd7}', '\u{1dd8}', '\u{1dd9}',
++    '\u{1dda}', '\u{1ddb}', '\u{1ddc}', '\u{1ddd}', '\u{1dde}', '\u{1ddf}', '\u{1de0}', '\u{1de1}',
++    '\u{1de2}', '\u{1de3}', '\u{1de4}', '\u{1de5}', '\u{1de6}', '\u{1dfe}', '\u{20d0}', '\u{20d1}',
++    '\u{20d4}', '\u{20d5}', '\u{20d6}', '\u{20d7}', '\u{20db}', '\u{20dc}', '\u{20e1}', '\u{20e7}',
++    '\u{20e9}', '\u{20f0}', '\u{2cef}', '\u{2cf0}', '\u{2cf1}', '\u{2de0}', '\u{2de1}', '\u{2de2}',
++    '\u{2de3}', '\u{2de4}', '\u{2de5}', '\u{2de6}', '\u{2de7}', '\u{2de8}', '\u{2de9}', '\u{2dea}',
++    '\u{2deb}', '\u{2dec}', '\u{2ded}', '\u{2dee}', '\u{2def}', '\u{2df0}', '\u{2df1}', '\u{2df2}',
++    '\u{2df3}', '\u{2df4}', '\u{2df5}', '\u{2df6}', '\u{2df7}', '\u{2df8}', '\u{2df9}', '\u{2dfa}',
++    '\u{2dfb}', '\u{2dfc}', '\u{2dfd}', '\u{2dfe}', '\u{2dff}', '\u{a66f}', '\u{a67c}', '\u{a67d}',
++    '\u{a6f0}', '\u{a6f1}', '\u{a8e0}', '\u{a8e1}', '\u{a8e2}', '\u{a8e3}', '\u{a8e4}', '\u{a8e5}',
++];
+ const ESC: &str = "\x1b";
+ const ST: &str = "\x1b\\";
+ const KITTY_CHUNK_SIZE: usize = 4096;
+@@ -247,9 +283,7 @@ impl KittyPlacement {
+             let [_, r, g, b] = id.to_be_bytes();
+             write!(writer, "\x1b[38;2;{r};{g};{b}m")?;
+             let remaining_cells = "\u{10eeee}".repeat(usize::from(area.width.saturating_sub(1)));
+-            for (y, mark) in (area.y..area.bottom()).zip([
+-                '\u{305}', '\u{30d}', '\u{30e}', '\u{310}', '\u{312}', '\u{33d}',
+-            ]) {
++            for (y, mark) in (area.y..area.bottom()).zip(IMAGE_ROW_MARKS.iter()) {
+                 queue!(writer, MoveTo(area.x, y))?;
+                 write!(writer, "\u{10eeee}{mark}{remaining_cells}")?;
+             }
+@@ -356,6 +390,17 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn image_click_preview_tmux_renders_more_than_six_rows() {
++        let mut output = Vec::new();
++        KittyPlacement::Virtual(0x800900)
++            .draw(&mut output, Rect::new(2, 3, 20, 40), b"")
++            .expect("placeholder output");
++        let text = String::from_utf8(output).expect("UTF-8 placeholder output");
++        assert_eq!(text.matches('\u{10eeee}').count(), 20 * 40);
++        assert!(text.contains(IMAGE_ROW_MARKS[39]));
++    }
++
+     struct EnvVarGuard {
+         name: &'static str,
+         previous: Option<std::ffi::OsString>,
+diff --git a/codex-rs/tui/src/transcript_image.rs b/codex-rs/tui/src/transcript_image.rs
+index 4a6d695..1aa599c 100644
+--- a/codex-rs/tui/src/transcript_image.rs
++++ b/codex-rs/tui/src/transcript_image.rs
+@@ -74,6 +74,34 @@ pub(crate) fn terminal_cell_size() -> Option<(u32, u32)> {
+ }
+ 
+ impl TranscriptImage {
++    /// Fit the original attachment to the available panel, rather than enlarging its thumbnail.
++    pub(crate) fn load_large(path: &Path, area: Rect, protocol: ImageProtocol) -> Option<Self> {
++        if area.is_empty() {
++            return None;
++        }
++        let (cell_width, cell_height) = terminal_cell_size().unwrap_or((8, 16));
++        let width = (u32::from(area.width) * cell_width).min(2048);
++        let height = (u32::from(area.height.min(256)) * cell_height).min(1536);
++        let mut pixels = Self::load_pixels(path, width, height)?;
++        let scale = (f64::from(width) / f64::from(pixels.width()))
++            .min(f64::from(height) / f64::from(pixels.height()));
++        if scale > 1.0 {
++            pixels = image::imageops::resize(
++                &pixels,
++                (f64::from(pixels.width()) * scale).floor().max(1.0) as u32,
++                (f64::from(pixels.height()) * scale).floor().max(1.0) as u32,
++                image::imageops::FilterType::Lanczos3,
++            );
++        }
++        Some(Self {
++            protocol,
++            columns: pixels.width().div_ceil(cell_width) as u16,
++            rows: pixels.height().div_ceil(cell_height) as u16,
++            pixels,
++            cell_width,
++            cell_height,
++        })
++    }
+     fn load_pixels(path: &Path, max_width: u32, max_height: u32) -> Option<RgbaImage> {
+         let metadata = path.metadata().ok()?;
+         if max_width == 0 || !metadata.is_file() || metadata.len() > 32 * 1024 * 1024 {
+diff --git a/codex-rs/tui/src/transcript_image/composer.rs b/codex-rs/tui/src/transcript_image/composer.rs
+index ee30881..2b04b93 100644
+--- a/codex-rs/tui/src/transcript_image/composer.rs
++++ b/codex-rs/tui/src/transcript_image/composer.rs
+@@ -38,6 +38,7 @@ pub(crate) struct ComposerImages {
+     background: (u8, u8, u8),
+     cache: RefCell<HashMap<TileKey, Option<Arc<TranscriptImage>>>>,
+     pub(crate) placements: RefCell<Vec<ImagePlacement>>,
++    hit_areas: RefCell<Vec<(Rect, PathBuf)>>,
+ }
+ 
+ impl ComposerImages {
+@@ -59,9 +60,19 @@ impl ComposerImages {
+             background,
+             cache: RefCell::default(),
+             placements: RefCell::default(),
++            hit_areas: RefCell::default(),
+         })
+     }
+ 
++    /// Resolve a thumbnail using its last painted cell rectangle.
++    pub(crate) fn image_at(&self, column: u16, row: u16) -> Option<PathBuf> {
++        self.hit_areas
++            .borrow()
++            .iter()
++            .find(|(area, _)| area.contains((column, row).into()))
++            .map(|(_, path)| path.clone())
++    }
++
+     /// Reserve a blank row between any visible strip and the draft.
+     pub(crate) fn height(&self, width: u16, count: usize) -> u16 {
+         let (visible, hidden) = visible_thumbnails(width, count);
+@@ -86,6 +97,7 @@ impl ComposerImages {
+         let mut previous = std::mem::take(&mut *cache);
+         let mut placements = self.placements.borrow_mut();
+         placements.clear();
++        self.hit_areas.borrow_mut().clear();
+         let style = crate::style::secondary_text_style();
+         let mut x = area.x;
+         if area.is_empty() {
+@@ -119,6 +131,7 @@ impl ComposerImages {
+                     .unwrap_or_else(|| self.load_tile(path).map(Arc::new))
+             });
+             let tile = Rect::new(x, area.y, WIDTH, HEIGHT);
++            self.hit_areas.borrow_mut().push((tile, path.clone()));
+             if let Some(image) = image {
+                 placements.push(ImagePlacement {
+                     image: image.clone(),

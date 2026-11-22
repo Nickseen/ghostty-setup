@@ -1,0 +1,11 @@
+--- a/src/git/status.rs
++++ b/src/git/status.rs
+@@ -88,7 +88,7 @@
+     /// Return the letter showing the status in the git column
+     pub fn letter(self) -> char {
+         match self {
+-            Self::New => 'N',
++            Self::New => 'U',
+             Self::Added => 'A',
+             Self::Staged => 'S',
+             Self::Modified => 'M',

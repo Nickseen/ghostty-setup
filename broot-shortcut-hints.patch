@@ -1,0 +1,14 @@
+--- a/src/app/standard_status.rs
++++ b/src/app/standard_status.rs
+@@ -185,6 +185,11 @@
+         }
+     }
+     pub fn status(self) -> Status {
++        if self.state_type == PanelStateType::Tree
++            && std::env::var_os("BROOT_SHORTCUT_HINTS").is_some()
++        {
++            return Status::from_message("*0*:.файлы · *⌘C*:пути · *⌘R*:Finder".to_string());
++        }
+         let ss = &self.ss;
+         let mut parts = StatusParts::default();
+         if self.has_previous_state && !self.is_filtered {

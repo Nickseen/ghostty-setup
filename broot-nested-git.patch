@@ -1,0 +1,138 @@
+--- a/src/git/status.rs
++++ b/src/git/status.rs
+@@ -213,6 +213,67 @@
+         .collect()
+ }
+ 
++/// Resolve only visited paths, and read each nested repository once per tree build.
++/// A clean nested repository must not inherit its parent's untracked status.
++pub struct NestedLineStatusComputer {
++    repositories: FxHashMap<PathBuf, Option<LineStatusComputer>>,
++    directories: FxHashMap<PathBuf, Option<PathBuf>>,
++}
++
++impl NestedLineStatusComputer {
++    pub fn new() -> Self {
++        Self {
++            repositories: FxHashMap::default(),
++            directories: FxHashMap::default(),
++        }
++    }
++
++    fn repository_dir(&mut self, directory: &Path) -> Option<PathBuf> {
++        let mut current = directory;
++        let mut visited = Vec::new();
++        let found = loop {
++            if let Some(cached) = self.directories.get(current) {
++                break cached.clone();
++            }
++            visited.push(current.to_path_buf());
++            // Worktrees and submodules use a .git file, ordinary repos a directory.
++            if current.join(".git").exists() {
++                break Some(current.to_path_buf());
++            }
++            match current.parent() {
++                Some(parent) => current = parent,
++                None => break None,
++            }
++        };
++        for path in visited {
++            self.directories.insert(path, found.clone());
++        }
++        found
++    }
++
++    pub fn line_status(&mut self, path: &Path) -> Option<LineGitStatus> {
++        let is_dir = path.is_dir();
++        let directory = if is_dir { path } else { path.parent()? };
++        let root = self.repository_dir(directory)?;
++        let computer = self.repositories.entry(root.clone())
++            .or_insert_with(|| LineStatusComputer::from_root(&root)).as_ref()?;
++        let exact = computer.line_status(path);
++        if exact.is_some() || !is_dir {
++            return exact;
++        }
++        // Bubble a real change up to its containing folder, including a closed repo.
++        // Ignored files alone must not make a clean repository look dirty.
++        computer.interesting_statuses.iter()
++            .filter(|(item, status)| item.starts_with(path) && **status != LineGitStatus::Ignored)
++            .map(|(_, status)| *status)
++            .max_by_key(|status| status.rank())
++    }
++
++    pub fn is_interesting(&mut self, path: &Path) -> bool {
++        self.line_status(path).is_some()
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct TreeGitStatus {
+     pub current_branch_name: Option<String>,
+--- a/src/git/mod.rs
++++ b/src/git/mod.rs
+@@ -19,6 +19,7 @@
+     status::{
+         LineGitStatus,
+         LineStatusComputer,
++        NestedLineStatusComputer,
+         TreeGitStatus,
+     },
+     status_computer::{
+--- a/src/tree_build/builder.rs
++++ b/src/tree_build/builder.rs
+@@ -7,7 +7,7 @@
+     crate::{
+         app::AppContext,
+         errors::TreeBuildError,
+-        git::{IgnoreChain, Ignorer, LineStatusComputer},
++        git::{IgnoreChain, Ignorer, NestedLineStatusComputer},
+         path::Directive,
+         pattern::Candidate,
+         task_sync::{ComputationResult, Dam},
+@@ -59,7 +59,7 @@
+     subpath_offset: usize,
+     total_search: bool,
+     git_ignorer: Ignorer,
+-    line_status_computer: Option<LineStatusComputer>,
++    line_status_computer: Option<NestedLineStatusComputer>,
+     con: &'c AppContext,
+     pub matches_max: Option<usize>, // optional hard limit
+     trim_root: bool,
+@@ -80,7 +80,7 @@
+         let line_status_computer = if options.filter_by_git_status || options.show_git_file_info {
+             time!(
+                 "init line_status_computer",
+-                LineStatusComputer::from_root(&path),
++                Some(NestedLineStatusComputer::new()),
+             )
+         } else {
+             None
+@@ -173,7 +173,7 @@
+                 false
+             };
+         if has_match && self.options.filter_by_git_status {
+-            if let Some(line_status_computer) = &self.line_status_computer {
++            if let Some(line_status_computer) = &mut self.line_status_computer {
+                 if !line_status_computer.is_interesting(&path) {
+                     has_match = false;
+                 }
+@@ -533,7 +533,7 @@
+             build_report: self.report,
+         };
+         tree.after_lines_changed();
+-        if let Some(computer) = self.line_status_computer {
++        if let Some(mut computer) = self.line_status_computer {
+             // tree git status is slow to compute, we just mark it should be
+             // done (later on)
+             tree.git_status = ComputationResult::NotComputed;
+--- a/src/display/col.rs
++++ b/src/display/col.rs
+@@ -131,7 +131,7 @@
+         let tree_options = &tree.options;
+         match self {
+             Col::Mark => tree_options.show_selection_mark,
+-            Col::Git => tree.git_status.is_some(),
++            Col::Git => tree_options.show_git_file_info || tree_options.filter_by_git_status,
+             Col::DeviceId => tree_options.show_device_id,
+             Col::Size => tree_options.show_sizes,
+             Col::Date => tree_options.show_dates,

@@ -1,0 +1,597 @@
+--- /dev/null
++++ b/src/tree/folder_folding.rs
+@@ -0,0 +1,87 @@
++//! Per-folder disclosure state for the personal Broot build.
++use std::{
++    collections::HashSet,
++    path::{Path, PathBuf},
++};
++
++#[derive(Debug, Clone, Default)]
++pub struct FolderFolding {
++    expanded: HashSet<PathBuf>,
++    search_collapsed: HashSet<PathBuf>,
++}
++
++impl FolderFolding {
++    pub fn from_env() -> Option<Self> {
++        (std::env::var("BROOT_CLICK_FOLDERS").as_deref() == Ok("1")).then(Self::default)
++    }
++
++    pub fn is_open(
++        &self,
++        path: &Path,
++        searching: bool,
++    ) -> bool {
++        if searching {
++            !self.search_collapsed.contains(path)
++        } else {
++            self.expanded.contains(path)
++        }
++    }
++
++    pub fn toggle(
++        &mut self,
++        path: &Path,
++        searching: bool,
++    ) {
++        if searching {
++            if !self.search_collapsed.remove(path) {
++                self.search_collapsed.insert(path.to_path_buf());
++            }
++        } else if !self.expanded.remove(path) {
++            self.expanded.insert(path.to_path_buf());
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn folders_start_closed_and_toggle_independently() {
++        let mut state = FolderFolding::default();
++        let a = Path::new("/project/Папка with spaces");
++        let b = Path::new("/project/other");
++        assert!(!state.is_open(a, false));
++        state.toggle(a, false);
++        assert!(state.is_open(a, false));
++        assert!(!state.is_open(b, false));
++        state.toggle(a, false);
++        assert!(!state.is_open(a, false));
++    }
++
++    #[test]
++    fn search_discovers_closed_folders_without_losing_normal_state() {
++        let mut state = FolderFolding::default();
++        let path = Path::new("/project/nested");
++        assert!(state.is_open(path, true));
++        assert!(!state.is_open(path, false));
++        state.toggle(path, true);
++        assert!(!state.is_open(path, true));
++        state.toggle(path, false);
++        assert!(state.is_open(path, false));
++        assert!(!state.is_open(path, true));
++    }
++
++    #[test]
++    fn a_closed_parent_retains_the_child_expansion_state() {
++        let mut state = FolderFolding::default();
++        let parent = Path::new("/project/a");
++        let child = Path::new("/project/a/b");
++        state.toggle(parent, false);
++        state.toggle(child, false);
++        state.toggle(parent, false);
++        let restored = state.clone();
++        assert!(!restored.is_open(parent, false));
++        assert!(restored.is_open(child, false));
++    }
++}
+--- a/src/tree/mod.rs
++++ b/src/tree/mod.rs
+@@ -1,3 +1,4 @@
++mod folder_folding;
+ mod sort;
+ mod tree;
+ mod tree_line;
+@@ -5,9 +6,6 @@
+ mod tree_options;
+ 
+ pub use {
+-    sort::Sort,
+-    tree::Tree,
+-    tree_line::*,
+-    tree_line_type::TreeLineType,
+-    tree_options::TreeOptions,
++    folder_folding::FolderFolding, sort::Sort, tree::Tree, tree_line::*,
++    tree_line_type::TreeLineType, tree_options::TreeOptions,
+ };
+--- a/src/tree/tree_options.rs
++++ b/src/tree/tree_options.rs
+@@ -1,12 +1,9 @@
+ use {
+-    super::Sort,
++    super::{FolderFolding, Sort},
+     crate::{
+         cli::Args,
+         conf::Conf,
+-        display::{
+-            Cols,
+-            DEFAULT_COLS,
+-        },
++        display::{Cols, DEFAULT_COLS},
+         errors::ConfError,
+         pattern::*,
+     },
+@@ -18,6 +15,7 @@
+ /// Options defining how the tree should be build and|or displayed
+ #[derive(Debug, Clone)]
+ pub struct TreeOptions {
++    pub folder_folding: Option<FolderFolding>,
+     pub show_selection_mark: bool, // whether to have a triangle left of selected line
+     pub show_hidden: bool,         // whether files whose name starts with a dot should be shown
+     pub only_folders: bool,        // whether to hide normal files and links
+@@ -44,6 +42,7 @@
+     /// clone self but without the pattern (if any)
+     pub fn without_pattern(&self) -> Self {
+         TreeOptions {
++            folder_folding: self.folder_folding.clone(),
+             show_selection_mark: self.show_selection_mark,
+             show_hidden: self.show_hidden,
+             only_folders: self.only_folders,
+@@ -236,6 +235,7 @@
+ impl Default for TreeOptions {
+     fn default() -> Self {
+         Self {
++            folder_folding: FolderFolding::from_env(),
+             show_selection_mark: false,
+             show_hidden: false,
+             only_folders: false,
+--- a/src/tree/tree.rs
++++ b/src/tree/tree.rs
+@@ -5,23 +5,15 @@
+         errors::TreeBuildError,
+         file_sum::FileSum,
+         git::TreeGitStatus,
+-        task_sync::{
+-            ComputationResult,
+-            Dam,
+-        },
+-        tree_build::{
+-            BuildReport,
+-            TreeBuilder,
+-        },
++        task_sync::{ComputationResult, Dam},
++        tree_build::{BuildReport, TreeBuilder},
+     },
+     rustc_hash::FxHashMap,
+     std::{
++        cell::RefCell,
+         cmp::Ord,
+         mem,
+-        path::{
+-            Path,
+-            PathBuf,
+-        },
++        path::{Path, PathBuf},
+     },
+ };
+ 
+@@ -31,6 +23,7 @@
+ ///  no link from a child to its parent or from a parent to its children.
+ #[derive(Debug, Clone)]
+ pub struct Tree {
++    pub disclosure_hits: RefCell<FxHashMap<(u16, u16), PathBuf>>,
+     pub lines: Vec<TreeLine>,
+     pub next_line_id: usize,
+     pub selection: usize, // there's always a selection (starts with root, which is 0)
+--- a/src/tree_build/builder.rs
++++ b/src/tree_build/builder.rs
+@@ -1,41 +1,25 @@
+ use {
+     super::{
+         BuildReport,
+-        bid::{
+-            BId,
+-            SortableBId,
+-        },
++        bid::{BId, SortableBId},
+         bline::BLine,
+     },
+     crate::{
+         app::AppContext,
+         errors::TreeBuildError,
+-        git::{
+-            IgnoreChain,
+-            Ignorer,
+-            LineStatusComputer,
+-        },
++        git::{IgnoreChain, Ignorer, LineStatusComputer},
+         path::Directive,
+         pattern::Candidate,
+-        task_sync::{
+-            ComputationResult,
+-            Dam,
+-        },
++        task_sync::{ComputationResult, Dam},
+         tree::*,
+     },
+     id_arena::Arena,
+     std::{
+-        collections::{
+-            BinaryHeap,
+-            VecDeque,
+-        },
++        collections::{BinaryHeap, VecDeque},
+         fs,
+         path::PathBuf,
+         result::Result,
+-        time::{
+-            Duration,
+-            Instant,
+-        },
++        time::{Duration, Instant},
+     },
+ };
+ 
+@@ -220,6 +204,13 @@
+                 }
+             }
+         };
++        // Keep an explicitly folded search ancestor visible so it can be reopened.
++        if file_type.is_dir() && self.options.pattern.is_some()
++            && self.options.folder_folding.as_ref().is_some_and(|folding|
++                !folding.is_open(&path, true))
++        {
++            has_match = true;
++        }
+         Some(BLine {
+             parent_id: Some(parent_id),
+             path,
+@@ -331,6 +322,7 @@
+         let deep = self.deep && self.options.show_tree && !self.options.sort.prevent_deep_display();
+         loop {
+             if !total_search
++                && !(self.options.folder_folding.is_some() && self.options.pattern.is_none())
+                 && ((nb_lines_ok > optimal_size)
+                     || (nb_lines_ok >= self.targeted_size && start.elapsed() > NOT_LONG))
+             {
+@@ -349,14 +341,14 @@
+                     if child.has_match {
+                         nb_lines_ok += 1;
+                     }
+-                    if self
+-                        .options
+-                        .max_depth
+-                        .is_some_and(|max| child.depth > max)
++                    if self.options.max_depth.is_some_and(|max| child.depth > max) {
++                        break;
++                    }
++                    if child.can_enter()
++                        && self.options.folder_folding.as_ref().is_none_or(|folding| {
++                            folding.is_open(&child.path, self.options.pattern.is_some())
++                        })
+                     {
+-                        break;
+-                    }
+-                    if child.can_enter() {
+                         next_level_dirs.push(child_id);
+                     }
+                     out_blines.push(child_id);
+@@ -509,7 +501,12 @@
+         for id in out_blines {
+             if self.blines[*id].has_match {
+                 // we need to count the children, so we load them
+-                if self.blines[*id].can_enter() && self.blines[*id].children.is_none() {
++                if self.blines[*id].can_enter()
++                    && self.blines[*id].children.is_none()
++                    && self.options.folder_folding.as_ref().is_none_or(|folding| {
++                        folding.is_open(&self.blines[*id].path, self.options.pattern.is_some())
++                    })
++                {
+                     self.load_children(*id);
+                 }
+                 if let Ok(tree_line) = self.make_tree_line(*id) {
+@@ -525,6 +522,7 @@
+         }
+         let next_line_id = lines.iter().map(|line| line.id).max().unwrap_or(0) + 1;
+         let mut tree = Tree {
++            disclosure_hits: Default::default(),
+             lines,
+             next_line_id,
+             selection: 0,
+--- a/src/display/displayable_tree.rs
++++ b/src/display/displayable_tree.rs
+@@ -1,11 +1,6 @@
+ use {
+     super::{
+-        BRANCH_FILLING,
+-        Col,
+-        CropWriter,
+-        GitStatusDisplay,
+-        MatchedString,
+-        SPACE_FILLING,
++        BRANCH_FILLING, Col, CropWriter, GitStatusDisplay, MatchedString, SPACE_FILLING,
+         num_format::format_count,
+     },
+     crate::{
+@@ -14,38 +9,19 @@
+         errors::ProgramError,
+         file_sum::FileSum,
+         pattern::PatternObject,
+-        skin::{
+-            ExtColorMap,
+-            StyleMap,
+-        },
++        skin::{ExtColorMap, StyleMap},
+         task_sync::ComputationResult,
+-        tree::{
+-            Tree,
+-            TreeLine,
+-            TreeLineType,
+-            sanitize_display_name,
+-        },
++        tree::{Tree, TreeLine, TreeLineType, sanitize_display_name},
+     },
+-    chrono::{
+-        DateTime,
+-        Local,
+-        LocalResult,
+-        TimeZone,
+-    },
++    chrono::{DateTime, Local, LocalResult, TimeZone},
+     crokey::crossterm::{
+-        QueueableCommand,
+-        cursor,
++        QueueableCommand, cursor,
++        style::{Attribute, Color},
+     },
+     file_size,
+     std::io::Write,
+-    termimad::{
+-        CompoundStyle,
+-        ProgressBar,
+-    },
+-    unicode_width::{
+-        UnicodeWidthChar,
+-        UnicodeWidthStr,
+-    },
++    termimad::{CompoundStyle, ProgressBar},
++    unicode_width::{UnicodeWidthChar, UnicodeWidthStr},
+ };
+ 
+ /// A tree wrapper which can be used either
+@@ -164,7 +140,9 @@
+         #[cfg(target_os = "windows")]
+         {
+             // Windows has a simpler device id, we use the "major" field only
+-            let device_id = line.device_id().map_or("         ".to_string(), |dev| dev.to_string());
++            let device_id = line
++                .device_id()
++                .map_or("         ".to_string(), |dev| dev.to_string());
+             cond_bg_attrs!(style, self, selected, self.skin.device_id_major);
+             cw.queue_g_string(style, format!("{}", device_id))?;
+         }
+@@ -213,7 +191,10 @@
+             let label_style = self.label_style(line, selected, false);
+             let pb = ProgressBar::new(s.part_of_size(total_size), 10);
+             cond_bg!(sparse_style, self, selected, self.skin.sparse);
+-            cw.queue_g_string(&label_style, format!("{:>4}", file_size::fit_4(s.to_size())))?;
++            cw.queue_g_string(
++                &label_style,
++                format!("{:>4}", file_size::fit_4(s.to_size())),
++            )?;
+             cw.queue_char(
+                 sparse_style,
+                 if s.is_sparse() && line.is_file() {
+@@ -296,6 +277,30 @@
+         }
+         if !branch.is_empty() {
+             cw.queue_g_string(branch_style, branch)?;
++        }
++        if let Some(folding) = self.tree.options.folder_folding.as_ref() {
++            if line.is_dir() && cw.allowed >= 2 {
++                let column = self.area.left + self.area.width.saturating_sub(cw.allowed as u16);
++                let row = self.area.top + (line_index - self.tree.scroll) as u16;
++                if self.in_app {
++                    self.tree
++                        .disclosure_hits
++                        .borrow_mut()
++                        .insert((column, row), line.path.clone());
++                }
++                let open = folding.is_open(&line.path, self.tree.options.pattern.is_some());
++                let mut disclosure_style = *branch_style;
++                disclosure_style.set_fg(Color::Rgb {
++                    r: 96,
++                    g: 165,
++                    b: 250,
++                });
++                disclosure_style.add_attr(Attribute::Bold);
++                cw.queue_char(&disclosure_style, if open { '▾' } else { '▸' })?;
++                cw.queue_char(branch_style, ' ')?;
++            } else {
++                cw.queue_str(branch_style, "  ")?;
++            }
+         }
+         Ok(0)
+     }
+@@ -485,6 +490,9 @@
+         let perm_writer = super::PermWriter::for_tree(self.skin, self.tree);
+ 
+         let tree = self.tree;
++        if self.in_app {
++            tree.disclosure_hits.borrow_mut().clear();
++        }
+         let total_size = tree.total_sum();
+         let scrollbar = if self.in_app {
+             termimad::compute_scrollbar(
+@@ -557,7 +565,7 @@
+                 let concrete_space_style;
+                 let space_style = if selected {
+                     concrete_space_style = if let Some(c) = self.skin.selected_line.get_bg() {
+-                        CompoundStyle ::with_bg(c)
++                        CompoundStyle::with_bg(c)
+                     } else {
+                         CompoundStyle::default()
+                     };
+@@ -568,9 +576,7 @@
+                 if visible_cols[0].needs_left_margin() {
+                     cw.queue_char(space_style, ' ')?;
+                 }
+-                let staged = self
+-                    .app_state
+-                    .is_some_and(|a| a.stage.contains(&line.path));
++                let staged = self.app_state.is_some_and(|a| a.stage.contains(&line.path));
+                 for col in &visible_cols {
+                     let void_len = match col {
+                         Col::Mark => self.write_line_selection_mark(cw, line, selected)?,
+@@ -583,12 +589,20 @@
+                         }
+ 
+                         Col::DeviceId => {
+-                            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
++                            #[cfg(not(any(
++                                target_os = "linux",
++                                target_os = "macos",
++                                target_os = "windows"
++                            )))]
+                             {
+                                 0
+                             }
+ 
+-                            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++                            #[cfg(any(
++                                target_os = "linux",
++                                target_os = "macos",
++                                target_os = "windows"
++                            ))]
+                             self.write_line_device_id(cw, line, selected)?
+                         }
+ 
+@@ -613,12 +627,7 @@
+                         Col::Size => {
+                             if tree.options.sort.prevent_deep_display() {
+                                 // as soon as there's only one level displayed we can show the size bars
+-                                self.write_line_size_with_bar(
+-                                    cw,
+-                                    line,
+-                                    total_size,
+-                                    selected,
+-                                )?
++                                self.write_line_size_with_bar(cw, line, total_size, selected)?
+                             } else {
+                                 Self::write_line_size(cw, line, &label_style, selected)?
+                             }
+--- a/src/browser/browser_state.rs
++++ b/src/browser/browser_state.rs
+@@ -284,22 +284,50 @@
+ 
+     fn on_click(
+         &mut self,
+-        _x: u16,
+-        y: u16,
+-        _screen: Screen,
+-        _con: &AppContext,
+-    ) -> Result<CmdResult, ProgramError> {
+-        self.displayed_tree_mut().try_select_y(y as usize);
+-        Ok(CmdResult::Keep)
+-    }
+-
+-    fn on_double_click(
+-        &mut self,
+-        _x: u16,
++        x: u16,
+         y: u16,
+         screen: Screen,
+         con: &AppContext,
+     ) -> Result<CmdResult, ProgramError> {
++        let disclosure = self
++            .displayed_tree()
++            .disclosure_hits
++            .borrow()
++            .get(&(x, y))
++            .cloned();
++        if let Some(path) = disclosure {
++            let page_height = Self::page_height(screen);
++            let tree = self.displayed_tree_mut();
++            let old_scroll = tree.scroll;
++            let searching = tree.options.pattern.is_some();
++            if let Some(folding) = tree.options.folder_folding.as_mut() {
++                folding.toggle(&path, searching);
++            }
++            tree.try_select_path(&path);
++            tree.refresh(page_height, con)?;
++            tree.scroll = old_scroll.min(tree.lines.len().saturating_sub(page_height));
++            tree.make_selection_visible(page_height);
++            return Ok(CmdResult::Keep);
++        }
++        self.displayed_tree_mut().try_select_y(y as usize);
++        Ok(CmdResult::Keep)
++    }
++
++    fn on_double_click(
++        &mut self,
++        x: u16,
++        y: u16,
++        screen: Screen,
++        con: &AppContext,
++    ) -> Result<CmdResult, ProgramError> {
++        if self
++            .displayed_tree()
++            .disclosure_hits
++            .borrow()
++            .contains_key(&(x, y))
++        {
++            return self.on_click(x, y, screen, con);
++        }
+         let tree = self.displayed_tree();
+         if tree.selection == y as usize + tree.scroll {
+             self.open_selection_stay_in_broot(screen, con, false, false)
+@@ -491,7 +519,10 @@
+                 if tree.options.pattern.is_some() {
+                     tree.try_select_previous_filtered(|line| line.direct_match, page_height);
+                 } else if tree.options.show_git_file_info || tree.options.filter_by_git_status {
+-                    tree.try_select_previous_filtered(|line| line.git_status.is_some(), page_height);
++                    tree.try_select_previous_filtered(
++                        |line| line.git_status.is_some(),
++                        page_height,
++                    );
+                 }
+                 CmdResult::Keep
+             }
+@@ -685,7 +716,10 @@
+                 let path = self.displayed_tree().selected_line().path.clone();
+                 info!("trash {:?}", path);
+ 
+-                #[cfg(any(target_os = "windows", all(unix, not(any(target_os = "ios", target_os = "android")))))]
++                #[cfg(any(
++                    target_os = "windows",
++                    all(unix, not(any(target_os = "ios", target_os = "android")))
++                ))]
+                 match trash::delete(&path) {
+                     Ok(()) => CmdResult::RefreshState { clear_cache: true },
+                     Err(e) => {
+@@ -694,7 +728,10 @@
+                     }
+                 }
+ 
+-                #[cfg(not(any(target_os = "windows", all(unix, not(any(target_os = "ios", target_os = "android"))))))]
++                #[cfg(not(any(
++                    target_os = "windows",
++                    all(unix, not(any(target_os = "ios", target_os = "android")))
++                )))]
+                 CmdResult::DisplayError("trash not supported on this platform".into())
+             }
+             Internal::up_tree => match self.displayed_tree().root().parent() {
+@@ -747,8 +784,8 @@
+         ssb.is_filtered = self.filtered_tree.is_some();
+         ssb.has_removed_pattern = false;
+         ssb.on_tree_root = tree.selection == 0;
+-        ssb.in_git_repo = !tree.options.filter_by_git_status
+-            && git::closest_repo_dir(tree.root()).is_some();
++        ssb.in_git_repo =
++            !tree.options.filter_by_git_status && git::closest_repo_dir(tree.root()).is_some();
+         ssb.status()
+     }
+ 

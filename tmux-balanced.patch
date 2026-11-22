@@ -1,0 +1,92 @@
+--- a/tmux.h
++++ b/tmux.h
+@@ -1837,6 +1837,7 @@
+ 	int		 mouse_scrolling_flag;
+ 	int		 mouse_slider_mpos;
+ 	int              mouse_last_pane;
++	void		*mouse_resize_state;
+ 	void		(*mouse_drag_update)(struct client *,
+ 			    struct mouse_event *);
+ 	void		(*mouse_drag_release)(struct client *,
+@@ -3860,6 +3861,9 @@
+ 		     u_int, struct visible_ranges *);
+ 
+ /* layout.c */
++void		 layout_resize_balanced_reset(struct client *);
++int		 layout_resize_balanced(struct client *, struct window *,
++		     struct mouse_event *);
+ u_int		 layout_count_cells(struct layout_cell *, int);
+ struct layout_cell *layout_create_cell(struct layout_cell *);
+ void		 layout_free_cell(struct layout_cell *, int);
+--- a/tty.c
++++ b/tty.c
+@@ -543,6 +543,7 @@
+ void
+ tty_free(struct tty *tty)
+ {
++	layout_resize_balanced_reset(tty->client);
+ 	tty_close(tty);
+ 
+ 	free(tty->r.ranges);
+--- a/cmd-resize-pane.c
++++ b/cmd-resize-pane.c
+@@ -35,6 +35,8 @@
+ static void		cmd_resize_pane_mouse_resize_move_floating(
+ 			    struct client *, struct mouse_event *);
+ static void		cmd_resize_pane_mouse_resize_tiled(struct client *,
++			    struct mouse_event *);
++static void		cmd_resize_pane_mouse_release_tiled(struct client *,
+ 			    struct mouse_event *);
+ 
+ const struct cmd_entry cmd_resize_pane_entry = {
+@@ -208,6 +210,8 @@
+ 		return (CMD_RETURN_NORMAL);
+ 
+ 	if (!window_pane_is_floating(wp)) {
++		layout_resize_balanced_reset(c);
++		c->tty.mouse_drag_release = cmd_resize_pane_mouse_release_tiled;
+ 		c->tty.mouse_drag_update = cmd_resize_pane_mouse_resize_tiled;
+ 		cmd_resize_pane_mouse_resize_tiled(c, &event->m);
+ 		return (CMD_RETURN_NORMAL);
+@@ -354,6 +358,12 @@
+ }
+ 
+ static void
++cmd_resize_pane_mouse_release_tiled(struct client *c, __unused struct mouse_event *m)
++{
++	layout_resize_balanced_reset(c);
++}
++
++static void
+ cmd_resize_pane_mouse_resize_tiled(struct client *c, struct mouse_event *m)
+ {
+ 	struct winlink		*wl;
+@@ -372,6 +382,8 @@
+ 		return;
+ 	}
+ 	w = wl->window;
++	if (layout_resize_balanced(c, w, m))
++		return;
+ 
+ 	y = m->y + m->oy; x = m->x + m->ox;
+ 	if (m->statusat == 0 && y >= m->statuslines)
+--- a/layout.c
++++ b/layout.c
+@@ -2058,3 +2058,6 @@
+ 
+ 	return (0);
+ }
++
++/* Private native balanced mouse resizing. */
++#include "layout-balanced.c"
+--- a/tmux.c
++++ b/tmux.c
+@@ -386,7 +386,7 @@
+ const char *
+ getversion(void)
+ {
+-	return (TMUX_VERSION);
++	return (TMUX_VERSION "-balanced.1");
+ }
+ 
+ int

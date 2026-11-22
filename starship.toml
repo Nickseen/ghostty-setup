@@ -1,0 +1,27 @@
+# One-line Catppuccin Mocha prompt. tmux already shows the clock.
+format = "$directory$git_branch$git_status$cmd_duration$character"
+add_newline = false
+
+[directory]
+style = "bold #89b4fa"
+truncation_length = 3
+truncate_to_repo = true
+format = "[$path]($style) "
+
+[git_branch]
+symbol = " "
+style = "bold #cba6f7"
+format = "[$symbol$branch]($style) "
+
+[git_status]
+style = "bold #f9e2af"
+format = "([$all_status$ahead_behind]($style) )"
+
+[cmd_duration]
+min_time = 10000
+style = "#6c7086"
+format = "[$duration]($style) "
+
+[character]
+success_symbol = "[❯](bold #a6e3a1)"
+error_symbol = "[❯](bold #f38ba8)"

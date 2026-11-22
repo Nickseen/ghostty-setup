@@ -1,0 +1,16 @@
+.build/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+*.log
+*.bak
+*.backup*
+.local/
+dist/
+audit-local.json
+auth.json
+sessions/
+*.sqlite*
+*.db
