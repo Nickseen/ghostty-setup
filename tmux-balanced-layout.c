@@ -8,7 +8,7 @@ struct balanced_cell {
 
 struct balanced_drag {
 	int active;
-	u_int window, width, height, count, border, ncells;
+	u_int window, width, height, count, border, target, ncells;
 	int origin;
 	enum layout_type type;
 	struct balanced_cell *cells;
@@ -90,7 +90,7 @@ static void
 balanced_start(struct balanced_drag *drag, struct window *w,
     struct mouse_event *m)
 {
-	struct layout_cell *border, *child, *nearby;
+	struct layout_cell *border, *child, *nearby, *selected;
 	static const int offsets[][2] = {{0, 1}, {1, 0}, {0, -1}, {-1, 0}};
 	u_int index;
 	int x, y;
@@ -121,12 +121,18 @@ balanced_start(struct balanced_drag *drag, struct window *w,
 	drag->capacity = xcalloc(drag->count, sizeof *drag->capacity);
 	drag->losses = xcalloc(drag->count, sizeof *drag->losses);
 	drag->desired = xcalloc(drag->count, sizeof *drag->desired);
+	selected = w->active != NULL ? w->active->layout_cell : NULL;
+	while (selected != NULL && selected->parent != border->parent)
+		selected = selected->parent;
+	drag->target = UINT_MAX;
 	index = 0;
 	TAILQ_FOREACH(child, &border->parent->cells, entry) {
 		if (!layout_cell_is_tiled(child) && !layout_cell_has_tiled_child(child))
 			continue;
 		if (child == border)
 			drag->border = index;
+		if (child == selected)
+			drag->target = index;
 		drag->siblings[index] = child;
 		drag->sizes[index] = drag->type == LAYOUT_LEFTRIGHT ?
 		    child->g.sx : child->g.sy;
@@ -135,6 +141,11 @@ balanced_start(struct balanced_drag *drag, struct window *w,
 	}
 	if (drag->border + 1 >= drag->count)
 		return;
+	/* Never guess another owner when the selected pane has no such edge. */
+	if (drag->target != drag->border && drag->target != drag->border + 1) {
+		drag->active = -1;
+		return;
+	}
 	drag->origin = drag->type == LAYOUT_LEFTRIGHT ? x : y;
 	drag->window = w->id;
 	drag->width = w->sx;
@@ -143,7 +154,16 @@ balanced_start(struct balanced_drag *drag, struct window *w,
 	drag->active = 1;
 }
 
-/* One fixed boundary owner grows or shrinks; every other sibling compensates. */
+/* Put rounding remainders across the held edge first on either target side. */
+static u_int
+balanced_share_index(struct balanced_drag *drag, u_int target, u_int rank)
+{
+	if (target <= drag->border)
+		return ((target + rank) % drag->count);
+	return ((target + drag->count - rank) % drag->count);
+}
+
+/* One fixed selected pane grows or shrinks; every other sibling compensates. */
 static int
 balanced_displacement(struct balanced_drag *drag, u_int target, int amount,
     int expanding)
@@ -157,7 +177,7 @@ balanced_displacement(struct balanced_drag *drag, u_int target, int amount,
 		quotient = amount / (drag->count - 1);
 		extra = amount % (drag->count - 1);
 		for (j = 1; j < drag->count; j++) {
-			index = (target + j) % drag->count;
+			index = balanced_share_index(drag, target, j);
 			drag->losses[index] = quotient + (j <= (u_int)extra);
 		}
 	} else {
@@ -174,7 +194,7 @@ balanced_displacement(struct balanced_drag *drag, u_int target, int amount,
 			extra = remaining % available;
 			rank = 0;
 			for (j = 1; j < drag->count; j++) {
-				index = (target + j) % drag->count;
+				index = balanced_share_index(drag, target, j);
 				if (drag->losses[index] == drag->capacity[index])
 					continue;
 				wanted = quotient + (rank++ < (u_int)extra);
@@ -194,7 +214,7 @@ balanced_displacement(struct balanced_drag *drag, u_int target, int amount,
 		if (i <= drag->border)
 			displacement += drag->desired[i] - drag->sizes[i];
 	}
-	return (expanding ? displacement : -displacement);
+	return (displacement < 0 ? -displacement : displacement);
 }
 
 /* A complete mouse frame is computed and applied in the server event loop. */
@@ -203,7 +223,7 @@ layout_resize_balanced(struct client *c, struct window *w, struct mouse_event *m
 {
 	struct balanced_drag *drag = c->tty.mouse_resize_state;
 	u_int i, index = 0, target;
-	int delta, requested, positive, low, high, middle, displacement, maximum;
+	int delta, requested, expanding, low, high, middle, displacement, maximum;
 	int changed = 0;
 
 	if (drag == NULL) {
@@ -222,12 +242,12 @@ layout_resize_balanced(struct client *c, struct window *w, struct mouse_event *m
 		return (1);
 	}
 	delta = balanced_position(m, 0, drag->type == LAYOUT_LEFTRIGHT) - drag->origin;
-	positive = delta >= 0;
-	requested = positive ? delta : -delta;
-	/* The cell owning this right/bottom border stays fixed across reversals. */
-	target = drag->border;
+	requested = delta >= 0 ? delta : -delta;
+	/* Selection is frozen at drag start, on either side of the shared edge. */
+	target = drag->target;
+	expanding = target <= drag->border ? delta >= 0 : delta <= 0;
 	low = high = 0;
-	if (!positive)
+	if (!expanding)
 		high = drag->capacity[target];
 	else {
 		for (i = 0; i < drag->count; i++) {
@@ -235,7 +255,7 @@ layout_resize_balanced(struct client *c, struct window *w, struct mouse_event *m
 				high += drag->capacity[i];
 		}
 	}
-	maximum = balanced_displacement(drag, target, high, positive);
+	maximum = balanced_displacement(drag, target, high, expanding);
 	if (requested > maximum)
 		requested = maximum;
 	/* Complete each equal-share round; at a hard stop avoid needless growth. */
@@ -244,20 +264,20 @@ layout_resize_balanced(struct client *c, struct window *w, struct mouse_event *m
 	while (low < high) {
 		if (requested < maximum) {
 			middle = low + (high - low + 1) / 2;
-			displacement = balanced_displacement(drag, target, middle, positive);
+			displacement = balanced_displacement(drag, target, middle, expanding);
 			if (displacement <= requested)
 				low = middle;
 			else
 				high = middle - 1;
 		} else {
 			middle = low + (high - low) / 2;
-			if (balanced_displacement(drag, target, middle, positive) < requested)
+			if (balanced_displacement(drag, target, middle, expanding) < requested)
 				low = middle + 1;
 			else
 				high = middle;
 		}
 	}
-	balanced_displacement(drag, target, low, positive);
+	balanced_displacement(drag, target, low, expanding);
 	for (i = 0; i < drag->count; i++) {
 		int size = drag->type == LAYOUT_LEFTRIGHT ?
 		    drag->siblings[i]->g.sx : drag->siblings[i]->g.sy;

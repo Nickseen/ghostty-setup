@@ -86,7 +86,7 @@
  getversion(void)
  {
 -	return (TMUX_VERSION);
-+	return (TMUX_VERSION "-balanced.3");
++	return (TMUX_VERSION "-balanced.4");
  }
  
  int

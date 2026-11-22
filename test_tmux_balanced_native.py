@@ -37,6 +37,7 @@ class Client:
         self.pane = self.run('new-session', '-dP', '-F', '#{pane_id}', '-s', 'check', '-x', '122', '-y', '60', '/bin/sleep 90')
         self.run('set-option', '-g', 'status', 'off')
         self.run('set-option', '-g', 'mouse', 'on')
+        self.run('unbind-key', '-n', 'MouseDown1Border')
         self.run('bind-key', '-n', 'M-MouseDown1Border', 'select-pane', '-t', '=')
         self.run('bind-key', '-n', 'M-MouseDrag1Border', 'resize-pane', '-M')
         self.pid, self.fd = pty.fork()
@@ -62,6 +63,7 @@ class Client:
                          w=root['w'] if vertical else size, h=size if vertical else root['h'])
             position += size + 1
         self.run('select-layout', '-t', self.pane, json.dumps(layout, separators=(',', ':')))
+        self.run('select-pane', '-t', self.pane)
         self.pump(.08)
 
     def layout(self):
@@ -104,6 +106,26 @@ def client(label):
 
 
 class NativeResizeTests(unittest.TestCase):
+    def test_third_pane_shrink_gives_space_to_both_other_panes(self):
+        with client('third-pane-recording') as c:
+            c.row([40, 30, 50])
+            third = c.layout()['L']['c'][2]['I']
+            c.run('select-pane', '-t', third)
+            c.down(71)
+            self.assertEqual(c.run('display-message', '-p', '#{pane_id}'), third)
+            c.move(dx=10)
+            self.assertEqual(c.sizes(), [45, 35, 40])
+            c.move(dx=0)
+            self.assertEqual(c.sizes(), [40, 30, 50])
+            c.move(dx=-10)
+            self.assertEqual(c.sizes(), [35, 25, 60])
+            c.move(dx=0)
+            c.up()
+            c.down(71, option=True)
+            c.move(dx=10)
+            self.assertEqual(c.sizes(), [40, 40, 40])
+            c.up()
+
     def test_live_rounding_reversal_and_option(self):
         with client('live') as c:
             c.row([40, 30, 50])
@@ -137,6 +159,7 @@ class NativeResizeTests(unittest.TestCase):
             c.up()
         with client('middle') as c:
             c.row([40, 30, 50])
+            c.run('select-pane', '-t', c.layout()['L']['c'][1]['I'])
             c.down(71)
             c.move(dx=4)
             self.assertEqual(c.sizes(), [36, 38, 46])
@@ -145,11 +168,9 @@ class NativeResizeTests(unittest.TestCase):
             self.assertEqual(c.sizes(), [44, 22, 54])
             c.up()
 
-    def test_fixed_boundary_owner_grows_and_shrinks_with_equal_compensation(self):
+    def test_selected_pane_grows_and_shrinks_with_equal_compensation(self):
         with client('fixed-owner-left') as c:
             c.row([40, 30, 50])
-            # The active pane is deliberately unrelated to the dragged border.
-            c.run('select-pane', '-t', c.layout()['L']['c'][-1]['I'])
             c.down(40)
             for delta in (-1, -5, -10, -12, -5, 0):
                 c.move(dx=delta)
@@ -160,6 +181,7 @@ class NativeResizeTests(unittest.TestCase):
             c.up()
         with client('fixed-owner-middle') as c:
             c.row([40, 30, 50])
+            c.run('select-pane', '-t', c.layout()['L']['c'][1]['I'])
             c.down(71)
             for delta in (1, 5, 12, 5, 0):
                 c.move(dx=delta)
@@ -174,11 +196,31 @@ class NativeResizeTests(unittest.TestCase):
             self.assertEqual(c.sizes(), [1, 51, 68])
             c.up()
 
+    def test_selection_controls_either_edge_and_foreign_edges_do_not_guess(self):
+        with client('selected-edges') as c:
+            c.row([40, 30, 50])
+            middle = c.layout()['L']['c'][1]['I']
+            third = c.layout()['L']['c'][2]['I']
+            c.run('select-pane', '-t', middle)
+            c.down(40)
+            c.move(dx=-5)
+            self.assertEqual(c.sizes(), [35, 40, 45])
+            c.move(dx=5)
+            self.assertEqual(c.sizes(), [45, 20, 55])
+            c.move(dx=0)
+            c.up()
+            c.run('select-pane', '-t', third)
+            c.down(40)
+            c.move(dx=8)
+            self.assertEqual(c.sizes(), [40, 30, 50])
+            c.up()
+
     def test_nested_groups_and_minimum_capacity(self):
         with client('nested') as c:
             c.row([40, 30, 50])
             third = c.layout()['L']['c'][-1]['I']
             c.run('split-window', '-v', '-t', third, '/bin/sleep 90')
+            c.run('select-pane', '-t', c.pane)
             original = c.layout()
             heights = [node['h'] for node in original['L']['c'][-1]['c']]
             c.down(40)
@@ -198,6 +240,7 @@ class NativeResizeTests(unittest.TestCase):
             c.up()
             second = c.layout()['L']['c'][1]['I']
             c.run('split-window', '-h', '-t', second, '/bin/sleep 90')
+            c.run('select-pane', '-t', c.pane)
             before = c.sizes()
             self.assertEqual(len(before), 4)
             c.down(before[0])
