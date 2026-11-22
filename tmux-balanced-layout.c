@@ -143,7 +143,14 @@ balanced_start(struct balanced_drag *drag, struct window *w,
 	drag->active = 1;
 }
 
-/* Equal absolute losses; only saturated donors stop participating. */
+/* Only the shrinking side of the dragged boundary supplies space. */
+static int
+balanced_donor(struct balanced_drag *drag, u_int index, int positive)
+{
+	return (positive ? index > drag->border : index <= drag->border);
+}
+
+/* Equal absolute losses on that side; saturated donors stop participating. */
 static int
 balanced_displacement(struct balanced_drag *drag, u_int grow, int amount,
     int positive)
@@ -155,7 +162,8 @@ balanced_displacement(struct balanced_drag *drag, u_int grow, int amount,
 	while (remaining > 0) {
 		available = 0;
 		for (i = 0; i < drag->count; i++) {
-			if (i != grow && drag->losses[i] < drag->capacity[i])
+			if (balanced_donor(drag, i, positive) &&
+			    drag->losses[i] < drag->capacity[i])
 				available++;
 		}
 		if (available == 0)
@@ -165,7 +173,8 @@ balanced_displacement(struct balanced_drag *drag, u_int grow, int amount,
 		rank = 0;
 		for (j = 0; j < drag->count; j++) {
 			index = positive ? (grow + 1 + j) % drag->count : j;
-			if (index == grow || drag->losses[index] == drag->capacity[index])
+			if (!balanced_donor(drag, index, positive) ||
+			    drag->losses[index] == drag->capacity[index])
 				continue;
 			wanted = quotient + (rank++ < (u_int)extra);
 			loss = drag->capacity[index] - drag->losses[index];
@@ -215,7 +224,7 @@ layout_resize_balanced(struct client *c, struct window *w, struct mouse_event *m
 	grow = positive ? drag->border : drag->border + 1;
 	low = high = 0;
 	for (i = 0; i < drag->count; i++) {
-		if (i != grow)
+		if (balanced_donor(drag, i, positive))
 			high += drag->capacity[i];
 	}
 	maximum = balanced_displacement(drag, grow, high, positive);

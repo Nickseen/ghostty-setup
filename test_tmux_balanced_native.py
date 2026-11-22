@@ -112,7 +112,7 @@ class NativeResizeTests(unittest.TestCase):
                 c.move(dx=delta)
                 self.assertEqual(c.sizes(), [40 + delta, 30 - (delta + 1) // 2, 50 - delta // 2])
             c.move(dx=-3)
-            self.assertEqual(c.sizes(), [37, 36, 47])
+            self.assertEqual(c.sizes(), [37, 33, 50])
             c.move(dx=0)
             self.assertEqual(c.sizes(), [40, 30, 50])
             c.move(dx=10)
@@ -132,15 +132,43 @@ class NativeResizeTests(unittest.TestCase):
             self.assertEqual(c.sizes('h'), [22, 15, 21])
             c.move(dy=0)
             self.assertEqual(c.sizes('h'), [16, 18, 24])
+            c.move(dy=-6)
+            self.assertEqual(c.sizes('h'), [10, 24, 24])
             c.up()
         with client('middle') as c:
             c.row([40, 30, 50])
             c.down(71)
             c.move(dx=4)
-            self.assertEqual(c.sizes(), [36, 38, 46])
+            self.assertEqual(c.sizes(), [40, 34, 46])
             self.assertEqual(c.layout()['L']['c'][1]['x'] + c.sizes()[1], 75)
             c.move(dx=-4)
             self.assertEqual(c.sizes(), [38, 28, 54])
+            c.up()
+
+    def test_only_panes_across_dragged_border_donate_space(self):
+        with client('side-only') as c:
+            c.row([40, 30, 50])
+            c.down(40)
+            for delta in (-1, -5, -12, -5, 0):
+                c.move(dx=delta)
+                self.assertEqual(c.sizes(), [40 + delta, 30 - delta, 50])
+            c.move(dx=10)
+            self.assertEqual(c.sizes(), [50, 25, 45])
+            c.up()
+        with client('side-only-right') as c:
+            c.row([40, 30, 50])
+            c.down(71)
+            for delta in (1, 5, 12, 5, 0):
+                c.move(dx=delta)
+                self.assertEqual(c.sizes(), [40, 30 + delta, 50 - delta])
+            c.move(dx=-10)
+            self.assertEqual(c.sizes(), [35, 25, 60])
+            c.up()
+        with client('side-only-minimum') as c:
+            c.row([3, 50, 67])
+            c.down(3)
+            c.move(dx=-3)
+            self.assertEqual(c.sizes(), [1, 52, 67])
             c.up()
 
     def test_nested_groups_and_minimum_capacity(self):

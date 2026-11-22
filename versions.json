@@ -4,7 +4,8 @@
   "codex": "0.169.0",
   "broot": "1.61.0",
   "tmux": "3.8",
-  "tmux_private": "3.8-balanced.1",
+  "tmux_private": "3.8-balanced.2",
+  "tmux_socket": "balanced-v2",
   "codex_packages": {
     "arm64": {
       "asset": "codex-package-aarch64-apple-darwin.tar.gz",

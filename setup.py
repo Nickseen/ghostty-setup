@@ -9,7 +9,7 @@ import platform
 import shutil
 import subprocess
 import sys
-from setup_support import ROOT, atomic_copy, atomic_write, brew_binary, install_launchers
+from setup_support import ROOT, VERSIONS, atomic_copy, atomic_write, brew_binary, install_launchers
 
 
 def run(args, **kwargs):
@@ -137,7 +137,7 @@ def doctor(args):
     for source, target in config_files(home):
         report(target.is_file() and target.read_text() == render(source.read_text(), home),
                'config ' + str(target.relative_to(home)))
-    for name, relative, version in [('tmux', 'tmux-balanced/3.8', 'tmux 3.8-balanced.1'),
+    for name, relative, version in [('tmux', 'tmux-balanced/3.8', 'tmux ' + VERSIONS['tmux_private']),
         ('codex', 'codex-image-preview/0.169.0', 'codex-cli 0.169.0'), ('broot', 'broot-folders/1.61.0', 'broot 1.61.0')]:
         custom = home / '.local/opt' / relative / 'bin' / name
         actual = output([custom, '-V' if name == 'tmux' else '--version'], timeout=20) if custom.is_file() else None
@@ -159,8 +159,9 @@ def doctor(args):
     if tmux.is_file():
         server = output([tmux, 'display-message', '-p', '#{version}'])
         if server:
-            report('balanced' in server, 'current/default tmux server: ' + server +
-                   ('; use tmux-balanced in a NEW tab; old tasks stay alive' if 'balanced' not in server else ''))
+            expected_server = VERSIONS['tmux_private']
+            report(server == expected_server, 'current/default tmux server: ' + server +
+                   ('; use tmux-balanced in a NEW tab; old tasks stay alive' if server != expected_server else ''))
             graphics = output([tmux, 'list-panes', '-a', '-F', '#{pane_id} #{allow-passthrough}'])
             report(bool(graphics) and all(x.endswith(' all') for x in graphics.splitlines()),
                    'graphics passthrough for all live panes')
@@ -168,7 +169,9 @@ def doctor(args):
             print('INFO no current/default tmux server')
         balanced = output([home / '.local/bin/tmux-balanced', 'display-message', '-p', '#{version}'])
         if balanced:
-            report('balanced' in balanced, 'isolated balanced server: ' + balanced)
+            report(balanced == VERSIONS['tmux_private'], 'isolated balanced server: ' + balanced)
+        else:
+            print('INFO start the updated server with: tmux-balanced new -A -s myproject')
         legacy = output([brew_binary('tmux'), '-L', 'default', 'display-message', '-p', '#{version}'])
         if legacy and 'balanced' not in legacy:
             print('INFO legacy default server still runs ' + legacy + '; its existing panes do not gain balanced resize.')
@@ -180,7 +183,7 @@ def doctor(args):
 
 def repair(args):
     install_launchers()
-    for socket in ['default', 'balanced']:
+    for socket in set(['default', 'balanced', VERSIONS['tmux_socket']]):
         command = [brew_binary('tmux'), '-L', socket]
         if output(command + ['list-sessions']) is not None:
             run(command + ['set-option', '-g', 'allow-passthrough', 'all'])

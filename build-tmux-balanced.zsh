@@ -17,6 +17,19 @@ fi
 if ! /usr/bin/grep -q mouse_resize_state "$source_dir/tmux.h"; then
     (cd "$source_dir" && /usr/bin/patch -p1 < "$setup_dir/tmux-balanced.patch")
 fi
+# Update the private revision in cached sources as well as fresh clones.
+/usr/bin/python3 - "$source_dir/tmux.c" "$setup_dir/versions.json" <<'PYREV'
+from pathlib import Path
+import json, re, sys
+p = Path(sys.argv[1])
+versions = json.loads(Path(sys.argv[2]).read_text())
+suffix = versions['tmux_private'][len(versions['tmux']):]
+text, count = re.subn(r'TMUX_VERSION "-balanced\.[0-9]+"',
+                      'TMUX_VERSION ' + json.dumps(suffix), p.read_text())
+if count != 1:
+    raise SystemExit('Private tmux version marker missing')
+p.write_text(text)
+PYREV
 /bin/cp "$setup_dir/tmux-balanced-layout.c" "$source_dir/layout-balanced.c"
 if [[ ! -f "$source_dir/Makefile" ]]; then
     cd "$source_dir"

@@ -59,13 +59,14 @@ def launcher_text(name, official, custom):
              '# Keep the tested build even when Homebrew upgrades its separate binary.',
              'if [[ ${' + optout + ':-0} != 1 && -x "$custom" ]]; then']
     if name == 'tmux':
+        socket = VERSIONS['tmux_socket']
         lines += ['    if [[ ${TMUX_BALANCED:-1} != 0 ]]; then',
                   '        explicit_socket=0',
                   '        for arg in "$@"; do',
                   '            case "$arg" in -L*|-S*) explicit_socket=1 ;; esac',
                   '        done',
-                  '        if [[ -z ${TMUX:-} && $explicit_socket == 0 && ${TMUX_SETUP_SOCKET:-balanced} != default ]]; then',
-                  '            exec "$custom" -L "${TMUX_SETUP_SOCKET:-balanced}" "$@"',
+                  '        if [[ -z ${TMUX:-} && $explicit_socket == 0 && ${TMUX_SETUP_SOCKET:-' + socket + '} != default ]]; then',
+                  '            exec "$custom" -L "${TMUX_SETUP_SOCKET:-' + socket + '}" "$@"',
                   '        fi',
                   '        exec "$custom" "$@"',
                   '    fi']
@@ -92,6 +93,6 @@ def install_launchers():
         atomic_write(target, launcher_text(name, brew_binary(name), custom), 0o755)
     atomic_write(paths / 'tmux-balanced', '#!/bin/zsh\n' + MARKER + '\n'
                  '# An isolated server guarantees the private resize implementation.\n'
-                 'exec "$HOME/.local/opt/tmux-balanced/' + VERSIONS['tmux'] + '/bin/tmux" -L balanced "$@"\n', 0o755)
+                 'exec "$HOME/.local/opt/tmux-balanced/' + VERSIONS['tmux'] + '/bin/tmux" -L ' + shlex.quote(VERSIONS['tmux_socket']) + ' "$@"\n', 0o755)
     atomic_write(paths / 'ghostty-setup', '#!/bin/zsh\n' + MARKER + '\nexec /usr/bin/python3 '
                  + shlex.quote(str(ROOT / 'setup.py')) + ' "$@"\n', 0o755)

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import setup
-from setup_support import atomic_write, launcher_text
+from setup_support import VERSIONS, atomic_write, launcher_text
 
 
 class SetupTests(unittest.TestCase):
@@ -54,7 +54,7 @@ class SetupTests(unittest.TestCase):
             env = {k: v for k, v in os.environ.items() if k not in ['TMUX', 'TMUX_SETUP_SOCKET', 'TMUX_OFFICIAL', 'TMUX_BALANCED']}
             def invoke(args, extra=None):
                 return subprocess.check_output([launcher] + args, text=True, env=dict(env, **(extra or {}))).splitlines()
-            self.assertEqual(invoke(['ls']), ['-L', 'balanced', 'ls'])
+            self.assertEqual(invoke(['ls']), ['-L', VERSIONS['tmux_socket'], 'ls'])
             self.assertEqual(invoke(['ls'], {'TMUX': '/tmp/old,1,0'}), ['ls'])
             self.assertEqual(invoke(['-L', 'test', 'ls']), ['-L', 'test', 'ls'])
 

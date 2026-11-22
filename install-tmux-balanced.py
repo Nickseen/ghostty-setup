@@ -7,15 +7,15 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
-from setup_support import atomic_copy, brew_binary, install_launchers
+from setup_support import VERSIONS, atomic_copy, brew_binary, install_launchers
 
 workspace = Path(__file__).resolve().parent
 binary = workspace / '.build/tmux-3.8/tmux'
 official = brew_binary('tmux')
 resolved = official.resolve(strict=True)
 version = subprocess.check_output([str(binary), '-V'], text=True).strip()
-if version != 'tmux 3.8-balanced.1':
-    raise SystemExit('Expected the tested private tmux 3.8-balanced.1')
+if version != 'tmux ' + VERSIONS['tmux_private']:
+    raise SystemExit('Expected the tested private tmux ' + VERSIONS['tmux_private'])
 target = Path.home() / '.local/opt/tmux-balanced/3.8'
 launchers = Path.home() / '.local/bin'
 stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
