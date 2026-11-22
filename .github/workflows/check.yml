@@ -9,6 +9,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shell syntax
         run: for script in *.zsh *.sh; do zsh -n "$script"; done
+      - name: Build native Trash helper
+        run: |
+          mkdir -p .build
+          swiftc broot-trash.swift -o .build/broot-trash
       - name: Portable installation and file operations
         run: python3 -m unittest -v test_setup test_broot_actions test_broot_file_import.FileImportTests
       - name: Preview install destinations
