@@ -6,7 +6,7 @@ jobs:
   configs-and-helpers:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Shell syntax
         run: for script in *.zsh *.sh; do zsh -n "$script"; done
       - name: Build native Trash helper
@@ -20,7 +20,7 @@ jobs:
   native-tmux:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Dependencies
         run: brew install libevent ncurses utf8proc jemalloc pkgconf
       - name: Build pinned tmux and exercise real mouse input
