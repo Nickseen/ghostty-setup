@@ -1,0 +1,373 @@
+diff --git a/codex-rs/tui/src/pager_overlay/image_preview.rs b/codex-rs/tui/src/pager_overlay/image_preview.rs
+--- a/codex-rs/tui/src/pager_overlay/image_preview.rs
++++ b/codex-rs/tui/src/pager_overlay/image_preview.rs
+@@ -1,8 +1,10 @@
+ //! A local attachment opens above the conversation without changing its draft or scroll position.
+ use std::path::PathBuf;
+ use std::sync::Arc;
+-
+-use crossterm::event::{KeyCode, KeyEventKind};
++use std::sync::mpsc;
++use std::time::{Duration, Instant};
++
++use crossterm::event::{KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+ use ratatui::layout::Rect;
+ use ratatui::style::{Color, Style};
+ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+@@ -10,12 +12,30 @@
+ use crate::pets::ImageProtocol;
+ use crate::transcript_image::{ImagePlacement, TranscriptImage};
+ use crate::tui::{Tui, TuiEvent};
++
++#[cfg(not(target_os = "android"))]
++type ClipboardImage = arboard::Clipboard;
++#[cfg(target_os = "android")]
++type ClipboardImage = ();
++
++#[derive(Debug, PartialEq, Eq)]
++enum MouseAction {
++    None,
++    Close,
++    Copy,
++}
+ 
+ pub(crate) struct ImagePreview {
+     path: PathBuf,
+     protocol: ImageProtocol,
+     cached: Option<(Rect, Option<Arc<TranscriptImage>>)>,
+     pub(crate) is_done: bool,
++    painted_frame: Option<Rect>,
++    painted_image: Option<Rect>,
++    last_click: Option<(Instant, u16, u16)>,
++    copy_pending: Option<mpsc::Receiver<Result<ClipboardImage, String>>>,
++    clipboard: Option<ClipboardImage>,
++    feedback: Option<String>,
+ }
+ 
+ impl ImagePreview {
+@@ -25,11 +45,100 @@
+             protocol,
+             cached: None,
+             is_done: false,
+-        }
++            painted_frame: None,
++            painted_image: None,
++            last_click: None,
++            copy_pending: None,
++            clipboard: None,
++            feedback: None,
++        }
++    }
++
++    fn mouse_action(&mut self, mouse: MouseEvent, now: Instant) -> MouseAction {
++        if mouse.kind != MouseEventKind::Down(MouseButton::Left) || !mouse.modifiers.is_empty() {
++            if matches!(
++                mouse.kind,
++                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
++            ) {
++                self.last_click = None;
++            }
++            return MouseAction::None;
++        }
++        let point = (mouse.column, mouse.row).into();
++        if !self
++            .painted_frame
++            .is_some_and(|frame| frame.contains(point))
++        {
++            self.last_click = None;
++            return MouseAction::None;
++        }
++        if !self
++            .painted_image
++            .is_some_and(|image| image.contains(point))
++        {
++            self.last_click = None;
++            return MouseAction::Close;
++        }
++        let double = self.last_click.take().is_some_and(|(previous, x, y)| {
++            now.saturating_duration_since(previous) <= Duration::from_millis(500)
++                && x.abs_diff(mouse.column) <= 1
++                && y.abs_diff(mouse.row) <= 1
++        });
++        if double {
++            MouseAction::Copy
++        } else {
++            self.last_click = Some((now, mouse.column, mouse.row));
++            MouseAction::None
++        }
++    }
++
++    fn start_copy(&mut self, tui: &Tui) {
++        if self.copy_pending.is_some() {
++            return;
++        }
++        let path = self.path.clone();
++        let frames = tui.frame_requester();
++        let (send, receive) = mpsc::channel();
++        self.copy_pending = Some(receive);
++        self.feedback = Some("Копирование…".into());
++        std::thread::spawn(move || {
++            let _ = send.send(copy_original_image(&path));
++            frames.schedule_frame();
++        });
++        tui.frame_requester().schedule_frame();
+     }
+ 
+     pub(crate) fn handle_event(&mut self, tui: &mut Tui, event: TuiEvent) -> std::io::Result<()> {
++        if let Some(pending) = &self.copy_pending {
++            match pending.try_recv() {
++                Ok(result) => {
++                    self.copy_pending = None;
++                    match result {
++                        Ok(clipboard) => {
++                            self.clipboard = Some(clipboard);
++                            self.feedback = Some("Изображение скопировано".into());
++                        }
++                        Err(error) => {
++                            self.feedback = Some(format!("Не удалось скопировать: {error}"))
++                        }
++                    }
++                    tui.frame_requester().schedule_frame();
++                }
++                Err(mpsc::TryRecvError::Disconnected) => {
++                    self.copy_pending = None;
++                    self.feedback = Some("Не удалось скопировать изображение".into());
++                    tui.frame_requester().schedule_frame();
++                }
++                Err(mpsc::TryRecvError::Empty) => {}
++            }
++        }
+         match event {
++            TuiEvent::Mouse(mouse) => match self.mouse_action(mouse, Instant::now()) {
++                MouseAction::Close => self.is_done = true,
++                MouseAction::Copy => self.start_copy(tui),
++                MouseAction::None => {}
++            },
++            TuiEvent::FocusLost => self.last_click = None,
+             TuiEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                     self.is_done = true;
+@@ -38,13 +147,23 @@
+             TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume | TuiEvent::FocusGained => {
+                 tui.draw(u16::MAX, |frame| {
+                     let area = frame.area();
++                    if self.painted_frame != Some(area) {
++                        self.last_click = None;
++                    }
++                    self.painted_frame = Some(area);
++                    self.painted_image = None;
+                     Clear.render(area, frame.buffer);
+                     let title = self.path.file_name().unwrap_or_default().to_string_lossy();
+                     let block = Block::default()
+                         .borders(Borders::ALL)
+                         .border_style(Style::default().fg(Color::Cyan))
+                         .title(format!(" {title} "))
+-                        .title_bottom(" Esc / Enter — вернуться в чат ");
++                        .title_bottom(format!(
++                            " {} ",
++                            self.feedback
++                                .as_deref()
++                                .unwrap_or("Esc / клик вне картинки — назад · 2×клик — копировать")
++                        ));
+                     let inner = block.inner(area);
+                     block.render(area, frame.buffer);
+                     if self.cached.as_ref().is_none_or(|(old, _)| *old != inner) {
+@@ -61,6 +180,7 @@
+                             image.columns.min(inner.width),
+                             image.rows.min(inner.height),
+                         );
++                        self.painted_image = Some(bounds);
+                         frame.image_placements.push(ImagePlacement {
+                             image: Arc::clone(image),
+                             area: bounds,
+@@ -78,3 +198,37 @@
+         Ok(())
+     }
+ }
++
++#[cfg(not(target_os = "android"))]
++fn read_original_image(path: &std::path::Path) -> Result<image::RgbaImage, String> {
++    let reader = image::ImageReader::open(path)
++        .map_err(|e| e.to_string())?
++        .with_guessed_format()
++        .map_err(|e| e.to_string())?;
++    crate::image_decode::decode_oriented(reader, image::Limits::default())
++        .map(|image| image.into_rgba8())
++        .map_err(|e| e.to_string())
++}
++
++#[cfg(not(target_os = "android"))]
++fn copy_original_image(path: &std::path::Path) -> Result<ClipboardImage, String> {
++    let image = read_original_image(path)?;
++    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
++    clipboard
++        .set_image(arboard::ImageData {
++            width: image.width() as usize,
++            height: image.height() as usize,
++            bytes: std::borrow::Cow::Owned(image.into_raw()),
++        })
++        .map_err(|e| e.to_string())?;
++    Ok(clipboard)
++}
++
++#[cfg(target_os = "android")]
++fn copy_original_image(_: &std::path::Path) -> Result<ClipboardImage, String> {
++    Err("Копирование изображений недоступно на Android".into())
++}
++
++#[cfg(test)]
++#[path = "image_preview_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/pager_overlay/image_preview_tests.rs b/codex-rs/tui/src/pager_overlay/image_preview_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/pager_overlay/image_preview_tests.rs
+@@ -0,0 +1,117 @@
++use super::*;
++use crossterm::event::KeyModifiers;
++
++fn click(x: u16, y: u16) -> MouseEvent {
++    MouseEvent {
++        kind: MouseEventKind::Down(MouseButton::Left),
++        column: x,
++        row: y,
++        modifiers: KeyModifiers::NONE,
++    }
++}
++fn painted() -> ImagePreview {
++    let mut view = ImagePreview::new("unused.png".into(), ImageProtocol::Kitty);
++    view.painted_frame = Some(Rect::new(0, 0, 80, 24));
++    view.painted_image = Some(Rect::new(10, 5, 40, 12));
++    view
++}
++
++#[test]
++fn image_click_preview_background_closes_but_image_and_unpainted_areas_do_not() {
++    let now = Instant::now();
++    let mut view = painted();
++    assert_eq!(view.mouse_action(click(10, 5), now), MouseAction::None);
++    assert_eq!(view.mouse_action(click(9, 5), now), MouseAction::Close);
++    assert_eq!(view.mouse_action(click(50, 5), now), MouseAction::Close);
++    assert_eq!(view.mouse_action(click(20, 17), now), MouseAction::Close);
++    assert_eq!(view.mouse_action(click(80, 5), now), MouseAction::None);
++    view.painted_frame = None;
++    assert_eq!(view.mouse_action(click(5, 5), now), MouseAction::None);
++}
++
++#[test]
++fn image_click_preview_double_click_copies_without_closing_or_triple_click_repeat() {
++    let now = Instant::now();
++    let mut view = painted();
++    assert_eq!(view.mouse_action(click(20, 10), now), MouseAction::None);
++    let mut release = click(20, 10);
++    release.kind = MouseEventKind::Up(MouseButton::Left);
++    assert_eq!(view.mouse_action(release, now), MouseAction::None);
++    assert_eq!(
++        view.mouse_action(click(21, 10), now + Duration::from_millis(200)),
++        MouseAction::Copy
++    );
++    assert!(!view.is_done);
++    assert_eq!(
++        view.mouse_action(click(20, 10), now + Duration::from_millis(300)),
++        MouseAction::None
++    );
++}
++
++#[test]
++fn image_click_preview_separate_slow_modified_or_right_clicks_do_not_copy() {
++    let now = Instant::now();
++    let mut view = painted();
++    assert_eq!(view.mouse_action(click(20, 10), now), MouseAction::None);
++    assert_eq!(
++        view.mouse_action(click(20, 10), now + Duration::from_secs(1)),
++        MouseAction::None
++    );
++    assert_eq!(
++        view.mouse_action(click(30, 10), now + Duration::from_millis(1200)),
++        MouseAction::None
++    );
++    let mut modified = click(30, 10);
++    modified.modifiers = KeyModifiers::SHIFT;
++    assert_eq!(view.mouse_action(modified, now), MouseAction::None);
++    let mut right = click(30, 10);
++    right.kind = MouseEventKind::Down(MouseButton::Right);
++    assert_eq!(view.mouse_action(right, now), MouseAction::None);
++    assert_eq!(view.mouse_action(click(30, 10), now), MouseAction::None);
++}
++
++#[test]
++fn image_click_preview_copy_reads_original_resolution_and_rgba_pixels() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("original.png");
++    let image =
++        image::RgbaImage::from_fn(800, 600, |x, y| image::Rgba([x as u8, y as u8, 90, 180]));
++    image.save(&path).unwrap();
++    assert_eq!(read_original_image(&path).unwrap(), image);
++    assert!(read_original_image(&dir.path().join("missing.png")).is_err());
++}
++
++#[tokio::test]
++async fn image_click_preview_rendered_padding_returns_to_chat_and_copy_failure_is_visible() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("wide.png");
++    image::RgbaImage::new(800, 100).save(&path).unwrap();
++    let mut view = ImagePreview::new(path, ImageProtocol::Kitty);
++    let mut tui = crate::tui::test_support::make_test_tui().unwrap();
++    tui.set_owned_screen(true).unwrap();
++    tui.terminal
++        .resize(ratatui::layout::Size::new(80, 24))
++        .unwrap();
++    view.handle_event(&mut tui, TuiEvent::Draw).unwrap();
++    let bounds = view.painted_image.unwrap();
++    assert!(bounds.y > 1, "wide image leaves a clickable top margin");
++    view.handle_event(&mut tui, TuiEvent::Mouse(click(bounds.x, bounds.y)))
++        .unwrap();
++    assert!(!view.is_done);
++    view.handle_event(&mut tui, TuiEvent::FocusLost).unwrap();
++    assert!(view.last_click.is_none());
++    let (send, receive) = mpsc::channel();
++    view.copy_pending = Some(receive);
++    send.send(Err("test copy failure".into())).unwrap();
++    view.handle_event(&mut tui, TuiEvent::Draw).unwrap();
++    assert!(
++        view.feedback
++            .as_ref()
++            .unwrap()
++            .contains("test copy failure")
++    );
++    assert!(view.copy_pending.is_none());
++    view.handle_event(&mut tui, TuiEvent::Mouse(click(1, 1)))
++        .unwrap();
++    assert!(view.is_done);
++}
+diff --git a/codex-rs/tui/src/app/image_click_preview_tests.rs b/codex-rs/tui/src/app/image_click_preview_tests.rs
+--- a/codex-rs/tui/src/app/image_click_preview_tests.rs
++++ b/codex-rs/tui/src/app/image_click_preview_tests.rs
+@@ -54,6 +54,27 @@
+         assert_eq!(app.chat_widget.capture_thread_input_state(), before);
+         app.render_owned_transcript(&mut tui, size)?;
+     }
++    assert!(app.preview_composer_image(MouseEvent {
++        kind: MouseEventKind::Down(MouseButton::Left),
++        column: thumbnail.x,
++        row: thumbnail.y,
++        modifiers: KeyModifiers::NONE,
++    }));
++    let overlay = app.overlay.as_mut().unwrap();
++    overlay.handle_event(&mut tui, TuiEvent::Draw)?;
++    overlay.handle_event(
++        &mut tui,
++        TuiEvent::Mouse(MouseEvent {
++            kind: MouseEventKind::Down(MouseButton::Left),
++            column: 0,
++            row: 0,
++            modifiers: KeyModifiers::NONE,
++        }),
++    )?;
++    assert!(overlay.is_done());
++    app.close_transcript_overlay(&mut tui);
++    assert_eq!(app.chat_widget.capture_thread_input_state(), before);
++    app.render_owned_transcript(&mut tui, size)?;
+     assert!(!app.preview_composer_image(MouseEvent {
+         kind: MouseEventKind::Down(MouseButton::Left),
+         column: label.x,

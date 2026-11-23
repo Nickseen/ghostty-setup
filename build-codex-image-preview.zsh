@@ -23,6 +23,10 @@ if ! rg -q 'let reusable_images' "$source_dir/codex-rs/tui/src/custom_terminal.r
     git -C "$source_dir" apply --check "$setup_dir/codex-image-scroll.patch"
     git -C "$source_dir" apply "$setup_dir/codex-image-scroll.patch"
 fi
+if ! rg -q 'fn mouse_action' "$source_dir/codex-rs/tui/src/pager_overlay/image_preview.rs"; then
+    git -C "$source_dir" apply --check "$setup_dir/codex-image-preview-mouse.patch"
+    git -C "$source_dir" apply "$setup_dir/codex-image-preview-mouse.patch"
+fi
 # Cargo resolves the unused V8 host workspace member too. Its Git source recursively
 # fetches Chromium submodules. Use the identical checked-out source for metadata;
 # the CLI uses the official separately packaged code-mode host executable.
