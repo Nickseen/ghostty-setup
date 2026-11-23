@@ -1,0 +1,64 @@
+diff --git a/codex-rs/tui/src/pets/image_protocol.rs b/codex-rs/tui/src/pets/image_protocol.rs
+--- a/codex-rs/tui/src/pets/image_protocol.rs
++++ b/codex-rs/tui/src/pets/image_protocol.rs
+@@ -311,17 +311,20 @@
+         let chunk = std::str::from_utf8(chunk).context("base64 payload is not valid UTF-8")?;
+         let has_more = index + 1 < chunks.len();
+         let more_flag = u8::from(has_more);
+-        if index == 0 {
++        let sequence = if index == 0 {
+             let image_id = kitty_image_id_arg(placement);
+-            command.push_str(&format!(
++            format!(
+                 "{ESC}_Ga=T,t=d,f=100,c={columns},r={rows},q=2{image_id},m={more_flag},C=1;{chunk}{ST}",
+-            ));
++            )
+         } else {
+-            command.push_str(&format!("{ESC}_Gm={more_flag};{chunk}{ST}"));
+-        }
+-    }
+-
+-    Ok(wrap_for_tmux_if_needed(&command))
++            format!("{ESC}_Gm={more_flag};{chunk}{ST}")
++        };
++        // A single passthrough DCS around the entire image exceeds tmux's 1 MiB
++        // input buffer for large previews. Wrap each Kitty chunk independently.
++        command.push_str(&wrap_for_tmux_if_needed(&sequence));
++    }
++
++    Ok(command)
+ }
+ 
+ pub fn kitty_transmit_png_file_with_id(
+@@ -455,6 +458,31 @@
+             wrap_for_tmux_if_needed("\x1b_Gx;\x1b\\"),
+             "\x1bPtmux;\x1b\x1b_Gx;\x1b\x1b\\\x1b\\"
+         );
++    }
++
++    #[test]
++    #[serial]
++    fn image_click_preview_large_payload_uses_bounded_tmux_packets() {
++        let _guard = EnvVarGuard::new("TMUX", Some("session"));
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("large.png");
++        let bytes = vec![0x5a; 1024 * 1024 + 37];
++        fs::write(&path, &bytes).unwrap();
++        let command =
++            kitty_transmit_png_with_id(&path, 58, 26, KittyPlacement::Virtual(42)).unwrap();
++        let packets: Vec<_> = command.split("\x1bPtmux;").skip(1).collect();
++        assert!(packets.len() > 300);
++        assert!(packets.iter().all(|packet| packet.len() < 8192));
++        assert_eq!(command.matches("a=T").count(), 1);
++        assert!(command.contains("i=42,U=1,m=1"));
++        let mut payload = String::new();
++        for packet in packets {
++            let (_, data) = packet.split_once(';').unwrap();
++            let (data, _) = data.split_once("\x1b\x1b\\").unwrap();
++            payload.push_str(data);
++        }
++        assert_eq!(general_purpose::STANDARD.decode(payload).unwrap(), bytes);
++        assert!(command.contains("\x1b_Gm=0;"));
+     }
+ 
+     #[test]

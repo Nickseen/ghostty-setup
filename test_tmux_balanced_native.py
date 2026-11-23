@@ -10,6 +10,7 @@ import shlex
 import struct
 import subprocess
 import termios
+import tempfile
 import time
 import unittest
 import setup
@@ -293,6 +294,35 @@ class NativeResizeTests(unittest.TestCase):
             self.assertTrue(c.run('show-buffer').startswith('abc'))
             c.run('resize-pane', '-t', c.pane, '-x', '45')
             self.assertEqual(c.sizes(), [45, 25, 50])
+
+
+class GraphicsTransportTests(unittest.TestCase):
+    def test_large_preview_survives_only_when_each_kitty_chunk_has_its_own_wrapper(self):
+        # Test the tmux boundary, not PNG decoding: fake base64 keeps this fast.
+        payload = 'A' * (1200 * 1024)
+        chunks = [payload[i:i + 4096] for i in range(0, len(payload), 4096)]
+        frames = ['\x1b_G' + ('a=T,t=d,f=100,i=42,' if i == 0 else '') +
+                  'm=' + str(int(i + 1 < len(chunks))) + ';' + chunk + '\x1b\\'
+                  for i, chunk in enumerate(chunks)]
+        def wrap(sequence):
+            return '\x1bPtmux;' + sequence.replace('\x1b', '\x1b\x1b') + '\x1b\\'
+        for label, data, expected in [('oversized', wrap(''.join(frames)), 0),
+                                      ('chunked', ''.join(map(wrap, frames)), len(frames))]:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp, client('graphics-' + label) as c:
+                c.run('set-option', '-g', 'allow-passthrough', 'all')
+                path = Path(tmp) / 'payload'
+                path.write_bytes(data.encode())
+                code = ('import sys,time;sys.stdout.buffer.write(open(sys.argv[1],"rb").read()+'
+                        'b"TRANSPORT_DONE");sys.stdout.flush();time.sleep(90)')
+                import sys
+                c.run('respawn-pane', '-k', '-t', c.pane, shlex.join([sys.executable, '-c', code, str(path)]))
+                output = bytearray()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and b'TRANSPORT_DONE' not in output:
+                    if select.select([c.fd], [], [], .05)[0]:
+                        output.extend(os.read(c.fd, 65536))
+                self.assertIn(b'TRANSPORT_DONE', output)
+                self.assertEqual(output.count(b'\x1b_G'), expected)
 
 
 class ColorEnvironmentTests(unittest.TestCase):

@@ -6,13 +6,18 @@ source "$setup_dir/build-env.zsh"
 if [[ ! -f "$source_dir/codex-rs/Cargo.toml" ]]; then
     git clone --depth 1 --branch rust-v0.169.0 https://github.com/openai/codex.git "$source_dir"
 fi
-if ! rg -q 'macos::clipboard_png' "$source_dir/codex-rs/tui/src/clipboard_paste.rs"; then
-    git -C "$source_dir" apply --check "$setup_dir/codex-image-paste.patch"
-    git -C "$source_dir" apply "$setup_dir/codex-image-paste.patch"
-fi
 if ! rg -q preview_composer_image "$source_dir/codex-rs/tui/src/app/owned_transcript.rs"; then
     git -C "$source_dir" apply --check "$setup_dir/codex-image-preview.patch"
     git -C "$source_dir" apply "$setup_dir/codex-image-preview.patch"
+fi
+# Cached preview sources may still use one oversized tmux packet per image.
+if ! rg -q 'Wrap each Kitty chunk independently' "$source_dir/codex-rs/tui/src/pets/image_protocol.rs"; then
+    git -C "$source_dir" apply --check "$setup_dir/codex-image-transport.patch"
+    git -C "$source_dir" apply "$setup_dir/codex-image-transport.patch"
+fi
+if ! rg -q 'macos::clipboard_png' "$source_dir/codex-rs/tui/src/clipboard_paste.rs"; then
+    git -C "$source_dir" apply --check "$setup_dir/codex-image-paste.patch"
+    git -C "$source_dir" apply "$setup_dir/codex-image-paste.patch"
 fi
 # Cargo resolves the unused V8 host workspace member too. Its Git source recursively
 # fetches Chromium submodules. Use the identical checked-out source for metadata;
