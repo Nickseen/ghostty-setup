@@ -19,6 +19,10 @@ if ! rg -q 'macos::clipboard_png' "$source_dir/codex-rs/tui/src/clipboard_paste.
     git -C "$source_dir" apply --check "$setup_dir/codex-image-paste.patch"
     git -C "$source_dir" apply "$setup_dir/codex-image-paste.patch"
 fi
+if ! rg -q 'let reusable_images' "$source_dir/codex-rs/tui/src/custom_terminal.rs"; then
+    git -C "$source_dir" apply --check "$setup_dir/codex-image-scroll.patch"
+    git -C "$source_dir" apply "$setup_dir/codex-image-scroll.patch"
+fi
 # Cargo resolves the unused V8 host workspace member too. Its Git source recursively
 # fetches Chromium submodules. Use the identical checked-out source for metadata;
 # the CLI uses the official separately packaged code-mode host executable.
@@ -26,5 +30,6 @@ export CODEX_IMAGE_BUILD_SOURCE="$source_dir"
 python3 "$setup_dir/prepare-codex-image-build.py"
 cd "$source_dir/codex-rs"
 cargo +1.99.1 build --profile dev-small -p codex-cli --bin codex -j 6
-cargo +1.99.1 test --profile dev-small -p codex-tui --lib image_click_preview -j 6
-cargo +1.99.1 test --profile dev-small -p codex-tui --lib clipboard_paste::macos::tests -j 6
+env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib image_click_preview -j 6
+env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib clipboard_paste::macos::tests -j 6
+env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib custom_terminal::tests -j 6

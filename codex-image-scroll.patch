@@ -1,0 +1,273 @@
+diff --git a/codex-rs/tui/src/custom_terminal.rs b/codex-rs/tui/src/custom_terminal.rs
+--- a/codex-rs/tui/src/custom_terminal.rs
++++ b/codex-rs/tui/src/custom_terminal.rs
+@@ -407,13 +407,33 @@
+             crate::transcript_image::FIRST_IMAGE_ID
+         };
+         let changed = *retained_images != images;
++        let reusable_images: Vec<bool> = images
++            .iter()
++            .enumerate()
++            .map(|(index, image)| {
++                self.tmux_kitty_image_base.is_some()
++                    && image.image.protocol == crate::pets::ImageProtocol::Kitty
++                    && retained_images
++                        .get(index)
++                        .is_some_and(|old| std::sync::Arc::ptr_eq(&old.image, &image.image))
++            })
++            .collect();
+         if changed {
+             if self.tmux_kitty_image_base.is_some() && !retained_images.is_empty() {
+                 // tmux retains placeholder text after Ghostty deletes the associated pixels.
+-                self.invalidate_viewport();
++                // Repaint only old image cells; scrolling must not redraw the entire page.
++                for placement in retained_images.iter() {
++                    for pos in placement.area.intersection(self.viewport_area).positions() {
++                        self.previous_buffer_mut()[pos]
++                            .set_diff_option(CellDiffOption::AlwaysUpdate);
++                    }
++                }
+             }
+             // Remove old graphics before text painting, including when switching to overlays.
+             for (index, placement) in retained_images.iter().enumerate() {
++                if reusable_images.get(index) == Some(&true) {
++                    continue;
++                }
+                 match placement.image.protocol {
+                     crate::pets::ImageProtocol::Kitty
+                     | crate::pets::ImageProtocol::KittyLocalFile => {
+@@ -446,14 +466,27 @@
+         }
+         self.flush_updates(updates)?;
+         if repaint_images {
+-            *retained_images = images;
+-            for (index, placement) in retained_images.iter_mut().enumerate() {
++            let mut previous_images = std::mem::take(retained_images);
++            for (index, placement) in images.iter_mut().enumerate() {
+                 let id = first_id + index as u32;
+                 let kitty_placement = if self.tmux_kitty_image_base.is_some() {
+                     crate::pets::KittyPlacement::Virtual(id)
+                 } else {
+                     crate::pets::KittyPlacement::Cursor(id)
+                 };
++                if reusable_images[index] {
++                    // Repaint/move placeholder cells, retaining pixels in the terminal.
++                    placement.file = previous_images[index].file.take();
++                    crossterm::queue!(self.backend, crossterm::cursor::SavePosition)?;
++                    kitty_placement.draw_rows(
++                        &mut self.backend,
++                        placement.area,
++                        &[],
++                        placement.first_row,
++                    )?;
++                    crossterm::queue!(self.backend, crossterm::cursor::RestorePosition)?;
++                    continue;
++                }
+                 placement.file = placement
+                     .image
+                     .draw(
+@@ -464,6 +497,7 @@
+                     )
+                     .map_err(io::Error::other)?;
+             }
++            *retained_images = images;
+         }
+ 
+         match cursor_position {
+@@ -943,6 +977,87 @@
+         fn flush(&mut self) -> io::Result<()> {
+             Ok(())
+         }
++    }
++
++    #[test]
++    fn image_scroll_cached_virtual_pixels_survive_motion_clipping_and_replacement() {
++        use crate::pets::ImageProtocol;
++        use crate::transcript_image::{ImagePlacement, TranscriptImage};
++        use std::sync::Arc;
++        let image = Arc::new(TranscriptImage {
++            protocol: ImageProtocol::Kitty,
++            columns: 6,
++            rows: 8,
++            pixels: image::RgbaImage::from_pixel(48, 128, image::Rgba([10, 110, 200, 255])),
++            cell_width: 8,
++            cell_height: 16,
++        });
++        let mut terminal = Terminal::with_options(CaptureBackend::new(40, 12)).unwrap();
++        terminal.tmux_kitty_image_base = Some(0x80_0100);
++        let size = terminal.last_known_screen_size;
++        terminal.set_viewport_area(Rect::new(0, 0, 40, 12));
++        let mut retained = Vec::new();
++        for _ in 0..10 {
++            for (y, height, first_row) in [(3, 8, 0), (2, 8, 0), (1, 7, 1), (1, 4, 4), (3, 8, 0)] {
++                terminal
++                    .draw_with_size(size, &mut retained, |frame| {
++                        Line::from("stable caption")
++                            .render(Rect::new(0, 0, 40, 1), frame.buffer_mut());
++                        frame.image_placements.push(ImagePlacement {
++                            image: Arc::clone(&image),
++                            area: Rect::new(2, y, 6, height),
++                            first_row,
++                            file: None,
++                        });
++                    })
++                    .unwrap();
++            }
++        }
++        let output = terminal.backend().output();
++        assert_eq!(
++            output.matches("_Ga=T").count(),
++            1,
++            "50 scroll frames must upload pixels once"
++        );
++        assert_eq!(output.matches("_Ga=d").count(), 0);
++        assert!(
++            output.contains("r=8,"),
++            "full image height, even when clipped"
++        );
++        assert!(
++            output.contains("\u{10eeee}\u{0312}"),
++            "clipped view starts at source row four"
++        );
++        assert_eq!(
++            output.matches("caption").count(),
++            1,
++            "scroll must not repaint unrelated text"
++        );
++        let replacement = Arc::new(TranscriptImage {
++            protocol: ImageProtocol::Kitty,
++            columns: 6,
++            rows: 8,
++            pixels: image::RgbaImage::from_pixel(48, 128, image::Rgba([200, 10, 20, 255])),
++            cell_width: 8,
++            cell_height: 16,
++        });
++        terminal
++            .draw_with_size(size, &mut retained, |frame| {
++                frame.image_placements.push(ImagePlacement {
++                    image: replacement,
++                    area: Rect::new(2, 3, 6, 8),
++                    first_row: 0,
++                    file: None,
++                });
++            })
++            .unwrap();
++        assert_eq!(terminal.backend().output().matches("_Ga=T").count(), 2);
++        assert_eq!(terminal.backend().output().matches("_Ga=d").count(), 1);
++        terminal
++            .draw_with_size(size, &mut retained, |_| {})
++            .unwrap();
++        assert_eq!(terminal.backend().output().matches("_Ga=d").count(), 2);
++        assert!(retained.is_empty());
+     }
+ 
+     #[test]
+@@ -1002,7 +1117,10 @@
+                     .unwrap();
+             }
+             let output = terminal.backend().output();
+-            assert_eq!(output.matches("_Ga=T").count(), 2);
++            assert_eq!(
++                output.matches("_Ga=T").count(),
++                if tmux_base.is_some() { 1 } else { 2 }
++            );
+             assert_eq!(output.matches("_Ga=d").count(), 0);
+             if tmux_base.is_some() {
+                 assert!(output.contains("i=8388864,U=1"));
+diff --git a/codex-rs/tui/src/transcript_image.rs b/codex-rs/tui/src/transcript_image.rs
+--- a/codex-rs/tui/src/transcript_image.rs
++++ b/codex-rs/tui/src/transcript_image.rs
+@@ -159,17 +159,25 @@
+         first_row: usize,
+         placement: KittyPlacement,
+     ) -> Result<Option<tempfile::NamedTempFile>> {
+-        let (top, bottom) = match self.protocol {
+-            ImageProtocol::Sixel => (
+-                first_row as u32 * self.cell_height,
+-                (first_row as u32 + u32::from(area.height)) * self.cell_height,
+-            ),
+-            // Kitty scales the entire raster to r=rows; clip at those scaled boundaries.
+-            ImageProtocol::Kitty | ImageProtocol::KittyLocalFile => (
+-                first_row as u32 * self.pixels.height() / u32::from(self.rows),
+-                (first_row as u32 + u32::from(area.height)) * self.pixels.height()
+-                    / u32::from(self.rows),
+-            ),
++        // Virtual placements can select source rows using Unicode placeholders.
++        // Upload the entire raster once so scrolling never requires new PNG pixels.
++        let virtual_image = matches!(placement, KittyPlacement::Virtual(_))
++            && self.protocol == ImageProtocol::Kitty;
++        let (top, bottom) = if virtual_image {
++            (0, self.pixels.height())
++        } else {
++            match self.protocol {
++                ImageProtocol::Sixel => (
++                    first_row as u32 * self.cell_height,
++                    (first_row as u32 + u32::from(area.height)) * self.cell_height,
++                ),
++                // Kitty scales the entire raster to r=rows; clip at those scaled boundaries.
++                ImageProtocol::Kitty | ImageProtocol::KittyLocalFile => (
++                    first_row as u32 * self.pixels.height() / u32::from(self.rows),
++                    (first_row as u32 + u32::from(area.height)) * self.pixels.height()
++                        / u32::from(self.rows),
++                ),
++            }
+         };
+         let top = top.min(self.pixels.height());
+         let height = bottom.min(self.pixels.height()) - top;
+@@ -192,7 +200,12 @@
+                     } else {
+                         crate::pets::kitty_transmit_png_with_id
+                     };
+-                    let command = transmit(png.path(), self.columns, area.height, placement)?;
++                    let rows = if virtual_image {
++                        self.rows
++                    } else {
++                        area.height
++                    };
++                    let command = transmit(png.path(), self.columns, rows, placement)?;
+                     file = (self.protocol == ImageProtocol::KittyLocalFile).then_some(png);
+                     command.into_bytes()
+                 }
+@@ -205,7 +218,12 @@
+             return Ok(None);
+         };
+         queue!(writer, SavePosition)?;
+-        placement.draw(writer, area, &payload)?;
++        placement.draw_rows(
++            writer,
++            area,
++            &payload,
++            if virtual_image { first_row } else { 0 },
++        )?;
+         queue!(writer, RestorePosition)?;
+         Ok(file)
+     }
+diff --git a/codex-rs/tui/src/pets/image_protocol.rs b/codex-rs/tui/src/pets/image_protocol.rs
+--- a/codex-rs/tui/src/pets/image_protocol.rs
++++ b/codex-rs/tui/src/pets/image_protocol.rs
+@@ -276,6 +276,16 @@
+         area: Rect,
+         payload: &[u8],
+     ) -> std::io::Result<()> {
++        self.draw_rows(writer, area, payload, 0)
++    }
++
++    pub(crate) fn draw_rows(
++        self,
++        writer: &mut impl Write,
++        area: Rect,
++        payload: &[u8],
++        first_row: usize,
++    ) -> std::io::Result<()> {
+         queue!(writer, MoveTo(area.x, area.y))?;
+         writer.write_all(payload)?;
+         if let KittyPlacement::Virtual(id) = self {
+@@ -283,7 +293,7 @@
+             let [_, r, g, b] = id.to_be_bytes();
+             write!(writer, "\x1b[38;2;{r};{g};{b}m")?;
+             let remaining_cells = "\u{10eeee}".repeat(usize::from(area.width.saturating_sub(1)));
+-            for (y, mark) in (area.y..area.bottom()).zip(IMAGE_ROW_MARKS.iter()) {
++            for (y, mark) in (area.y..area.bottom()).zip(IMAGE_ROW_MARKS.iter().skip(first_row)) {
+                 queue!(writer, MoveTo(area.x, y))?;
+                 write!(writer, "\u{10eeee}{mark}{remaining_cells}")?;
+             }
