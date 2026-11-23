@@ -1,0 +1,160 @@
+diff --git a/codex-rs/tui/src/clipboard_paste.rs b/codex-rs/tui/src/clipboard_paste.rs
+index d362d69..fd529c6 100644
+--- a/codex-rs/tui/src/clipboard_paste.rs
++++ b/codex-rs/tui/src/clipboard_paste.rs
+@@ -59,6 +59,15 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
+     tracing::debug!("attempting clipboard image read");
+     let mut clipboard = arboard::Clipboard::new()
+         .map_err(|e| PasteImageError::ClipboardUnavailable(e.to_string()))?;
++    // Screenshots already offer a PNG. Keep its original bytes instead of blocking
++    // the UI on a full-size decode followed by another lossless compression pass.
++    // Copied files still take precedence over their pasteboard preview.
++    #[cfg(target_os = "macos")]
++    if clipboard.get().file_list().unwrap_or_default().is_empty()
++        && let Some(encoded) = macos::clipboard_png()
++    {
++        return Ok(encoded);
++    }
+     let image = read_clipboard_image(&mut clipboard)?;
+ 
+     let span = tracing::debug_span!("encode_image", byte_length = tracing::field::Empty).entered();
+diff --git a/codex-rs/tui/src/clipboard_paste/macos.rs b/codex-rs/tui/src/clipboard_paste/macos.rs
+index d4c3106..02fc8b0 100644
+--- a/codex-rs/tui/src/clipboard_paste/macos.rs
++++ b/codex-rs/tui/src/clipboard_paste/macos.rs
+@@ -1,10 +1,14 @@
+ //! Read native image representations in macOS pasteboard item order.
+ 
++use super::EncodedImageFormat;
++use super::PastedImageInfo;
+ use crate::image_decode::decode_oriented;
+ use image::DynamicImage;
++use image::ImageDecoder;
+ use image::ImageFormat;
+ use image::ImageReader;
+ use image::Limits;
++use image::metadata::Orientation;
+ use objc2_app_kit::NSPasteboard;
+ use objc2_app_kit::NSPasteboardItem;
+ use objc2_foundation::NSArray;
+@@ -12,6 +16,55 @@ use objc2_foundation::NSString;
+ use objc2_foundation::ns_string;
+ use std::io::Cursor;
+ 
++pub(super) fn clipboard_png() -> Option<(Vec<u8>, PastedImageInfo)> {
++    objc2::rc::autoreleasepool(|_| {
++        let items = NSPasteboard::generalPasteboard().pasteboardItems()?;
++        first_encoded_png(&items)
++    })
++}
++
++fn first_encoded_png(items: &NSArray<NSPasteboardItem>) -> Option<(Vec<u8>, PastedImageInfo)> {
++    for item in items {
++        let types = item.types();
++        if types.containsObject(ns_string!("public.png"))
++            && let Some(bytes) = item.dataForType(ns_string!("public.png"))
++            && let Some(encoded) = encoded_png(bytes.to_vec())
++        {
++            return Some(encoded);
++        }
++        // Don't skip an earlier JPEG/TIFF to paste a different item's PNG.
++        if types.containsObject(ns_string!("public.jpeg"))
++            || types.containsObject(ns_string!("public.tiff"))
++        {
++            return None;
++        }
++    }
++    None
++}
++
++fn encoded_png(bytes: Vec<u8>) -> Option<(Vec<u8>, PastedImageInfo)> {
++    let mut decoder = ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Png)
++        .into_decoder()
++        .ok()?;
++    // Preserve the existing allocation ceiling and orientation behavior. Images
++    // requiring a transform take the normal decode/encode path instead.
++    let mut limits = Limits::default();
++    limits.reserve(decoder.total_bytes()).ok()?;
++    if decoder.orientation().ok()? != Orientation::NoTransforms {
++        return None;
++    }
++    let (width, height) = decoder.dimensions();
++    drop(decoder);
++    Some((
++        bytes,
++        PastedImageInfo {
++            width,
++            height,
++            encoded_format: EncodedImageFormat::Png,
++        },
++    ))
++}
++
+ /// Decode an offered PNG or JPEG before falling back to [arboard's macOS image reader].
+ /// That reader requests TIFF even when the pasteboard already holds the original PNG or
+ /// JPEG. Clipboard owners such as Vicinae then generate a large TIFF just for this paste.
+diff --git a/codex-rs/tui/src/clipboard_paste/macos_tests.rs b/codex-rs/tui/src/clipboard_paste/macos_tests.rs
+index 1faffd5..0c3257a 100644
+--- a/codex-rs/tui/src/clipboard_paste/macos_tests.rs
++++ b/codex-rs/tui/src/clipboard_paste/macos_tests.rs
+@@ -48,3 +48,60 @@ fn jpeg_item_precedes_later_png() {
+         Some(DynamicImage::new_rgb8(/*width*/ 3, /*height*/ 1))
+     );
+ }
++
++#[test]
++fn image_paste_latency_png_preserves_bytes_and_precedence() {
++    let bytes = encoded(ImageFormat::Png, 4);
++    let png = item(ns_string!("public.png"), &bytes);
++    let (copied, info) = first_encoded_png(&NSArray::from_retained_slice(&[png])).unwrap();
++    assert_eq!(copied, bytes);
++    assert_eq!((info.width, info.height), (4, 1));
++    assert_eq!(info.encoded_format, super::super::EncodedImageFormat::Png);
++    let tiff = item(ns_string!("public.tiff"), b"earlier image");
++    let png = item(ns_string!("public.png"), &bytes);
++    assert!(first_encoded_png(&NSArray::from_retained_slice(&[tiff, png])).is_none());
++    assert!(encoded_png(b"invalid PNG".to_vec()).is_none());
++}
++
++#[test]
++fn image_paste_latency_png_orientation_uses_normalization_fallback() {
++    let pixels = DynamicImage::new_rgb8(3, 2);
++    let mut bytes = Vec::new();
++    // EXIF orientation 6 (90 degrees clockwise), little-endian TIFF header.
++    let exif = vec![
++        0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 1, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
++    ];
++    use image::ImageEncoder;
++    let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
++    encoder.set_exif_metadata(exif).unwrap();
++    pixels.write_with_encoder(encoder).unwrap();
++    assert!(encoded_png(bytes).is_none());
++}
++
++#[test]
++#[ignore = "manual timing; no wall-clock assertion on shared CI hosts"]
++fn image_paste_latency_benchmark() {
++    use std::time::Instant;
++    let mut fixture = image::RgbImage::new(2560, 1440);
++    for (x, y, pixel) in fixture.enumerate_pixels_mut() {
++        *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
++    }
++    let image = DynamicImage::ImageRgb8(fixture);
++    let mut png = Cursor::new(Vec::new());
++    image.write_to(&mut png, ImageFormat::Png).unwrap();
++    let png = png.into_inner();
++    let start = Instant::now();
++    let decoded = decode_oriented(
++        ImageReader::with_format(Cursor::new(&png), ImageFormat::Png),
++        Limits::default(),
++    )
++    .unwrap();
++    let mut reencoded = Cursor::new(Vec::new());
++    decoded.write_to(&mut reencoded, ImageFormat::Png).unwrap();
++    let old = start.elapsed();
++    let start = Instant::now();
++    let (_, info) = encoded_png(png.clone()).unwrap();
++    let new = start.elapsed();
++    assert_eq!((info.width, info.height), (2560, 1440));
++    eprintln!("PNG paste processing: old={old:?}, original-bytes={new:?}");
++}

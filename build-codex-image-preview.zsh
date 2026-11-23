@@ -6,6 +6,10 @@ source "$setup_dir/build-env.zsh"
 if [[ ! -f "$source_dir/codex-rs/Cargo.toml" ]]; then
     git clone --depth 1 --branch rust-v0.169.0 https://github.com/openai/codex.git "$source_dir"
 fi
+if ! rg -q 'macos::clipboard_png' "$source_dir/codex-rs/tui/src/clipboard_paste.rs"; then
+    git -C "$source_dir" apply --check "$setup_dir/codex-image-paste.patch"
+    git -C "$source_dir" apply "$setup_dir/codex-image-paste.patch"
+fi
 if ! rg -q preview_composer_image "$source_dir/codex-rs/tui/src/app/owned_transcript.rs"; then
     git -C "$source_dir" apply --check "$setup_dir/codex-image-preview.patch"
     git -C "$source_dir" apply "$setup_dir/codex-image-preview.patch"
@@ -18,3 +22,4 @@ python3 "$setup_dir/prepare-codex-image-build.py"
 cd "$source_dir/codex-rs"
 cargo +1.99.1 build --profile dev-small -p codex-cli --bin codex -j 6
 cargo +1.99.1 test --profile dev-small -p codex-tui --lib image_click_preview -j 6
+cargo +1.99.1 test --profile dev-small -p codex-tui --lib clipboard_paste::macos::tests -j 6
