@@ -31,6 +31,10 @@ if ! rg -q 'fn resize_viewport_for_frame' "$source_dir/codex-rs/tui/src/tui.rs";
     git -C "$source_dir" apply --check "$setup_dir/codex-resize-no-flash.patch"
     git -C "$source_dir" apply "$setup_dir/codex-resize-no-flash.patch"
 fi
+if ! rg -q 'Stale/overlapping turn metadata' "$source_dir/codex-rs/tui/src/app/history_completion.rs"; then
+    git -C "$source_dir" apply --check "$setup_dir/codex-history-pagination.patch"
+    git -C "$source_dir" apply "$setup_dir/codex-history-pagination.patch"
+fi
 # Cargo resolves the unused V8 host workspace member too. Its Git source recursively
 # fetches Chromium submodules. Use the identical checked-out source for metadata;
 # the CLI uses the official separately packaged code-mode host executable.
@@ -42,3 +46,4 @@ env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib image_
 env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib clipboard_paste::macos::tests -j 6
 env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib custom_terminal::tests -j 6
 env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib resize_no_flash -j 6
+env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib history_pagination -j 6

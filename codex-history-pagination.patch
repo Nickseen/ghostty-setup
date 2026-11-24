@@ -1,0 +1,109 @@
+diff --git a/codex-rs/tui/src/app/history_completion.rs b/codex-rs/tui/src/app/history_completion.rs
+index 12c7d5e..6a0e87f 100644
+--- a/codex-rs/tui/src/app/history_completion.rs
++++ b/codex-rs/tui/src/app/history_completion.rs
+@@ -24,7 +24,9 @@ pub(super) fn group_turn_items<'a>(
+     let mut groups = Vec::new();
+     for turn in turns {
+         if let Some(last) = turn.items.last() {
+-            end = offsets.get(last.id()).copied();
++            // Stale/overlapping turn metadata must never move a page boundary
++            // backwards or complete the same item twice. Keep item order intact.
++            end = offsets.get(last.id()).copied().filter(|end| *end > start);
+         } else if turn.status != TurnStatus::Interrupted
+             || turn.items_view == TurnItemsView::NotLoaded
+         {
+diff --git a/codex-rs/tui/src/app/history_completion_tests.rs b/codex-rs/tui/src/app/history_completion_tests.rs
+index f457a7e..a6333bf 100644
+--- a/codex-rs/tui/src/app/history_completion_tests.rs
++++ b/codex-rs/tui/src/app/history_completion_tests.rs
+@@ -87,3 +87,89 @@ fn itemless_interruptions_keep_their_position_on_the_owning_page() {
+         vec![(0..1, Some(&turns[3]))],
+     );
+ }
++
++#[test]
++fn history_pagination_bounds_reversed_turn_metadata_preserves_every_item() {
++    let turns = [
++        turn("later", TurnStatus::Completed, &["b"]),
++        turn("stale", TurnStatus::Completed, &["a"]),
++        turn("stale interruption", TurnStatus::Interrupted, &[]),
++    ];
++    let ordered = turn("items", TurnStatus::Completed, &["a", "b", "c"]);
++    let items = payloads(&ordered.items);
++    assert_eq!(
++        group_turn_items(&items, &turns),
++        vec![(0..2, Some(&turns[0])), (2..3, None)]
++    );
++}
++
++#[test]
++fn history_pagination_bounds_duplicate_completion_does_not_repeat_footer() {
++    let turns = [
++        turn("first", TurnStatus::Completed, &["a"]),
++        turn("duplicate", TurnStatus::Completed, &["a"]),
++    ];
++    let items = payloads(&turns[0].items);
++    assert_eq!(
++        group_turn_items(&items, &turns),
++        vec![(0..1, Some(&turns[0]))]
++    );
++}
++
++#[test]
++fn history_pagination_bounds_95_to_94_cannot_panic() {
++    let ids = (0..96).map(|i| format!("item-{i}")).collect::<Vec<_>>();
++    let refs = ids.iter().map(String::as_str).collect::<Vec<_>>();
++    let source = turn("page", TurnStatus::Completed, &refs);
++    let turns = [
++        turn("later", TurnStatus::Completed, &["item-94"]),
++        turn("stale", TurnStatus::Completed, &["item-93"]),
++    ];
++    let items = payloads(&source.items);
++    let groups = group_turn_items(&items, &turns);
++    let visited = groups
++        .iter()
++        .flat_map(|(range, _)| items[range.clone()].iter().map(ThreadItemPayload::id))
++        .collect::<Vec<_>>();
++    assert_eq!(
++        visited,
++        items.iter().map(ThreadItemPayload::id).collect::<Vec<_>>()
++    );
++}
++
++#[test]
++fn history_pagination_bounds_all_turn_orders_and_partial_pages_are_safe() {
++    let turns = [
++        turn("a", TurnStatus::Completed, &["a"]),
++        turn("b", TurnStatus::Completed, &["b"]),
++        turn("c", TurnStatus::Completed, &["c"]),
++    ];
++    let items = turns
++        .iter()
++        .flat_map(Turn::item_payloads)
++        .cloned()
++        .collect::<Vec<_>>();
++    for order in [
++        [0, 1, 2],
++        [0, 2, 1],
++        [1, 0, 2],
++        [1, 2, 0],
++        [2, 0, 1],
++        [2, 1, 0],
++    ] {
++        let metadata = order.iter().map(|&i| turns[i].clone()).collect::<Vec<_>>();
++        for start in 0..=items.len() {
++            for end in start..=items.len() {
++                let page = &items[start..end];
++                let mut cursor = 0;
++                for (range, _) in group_turn_items(page, &metadata) {
++                    assert_eq!(range.start, cursor);
++                    assert!(range.start <= range.end && range.end <= page.len());
++                    let _ = &page[range.clone()];
++                    cursor = range.end;
++                }
++                assert_eq!(cursor, page.len());
++            }
++        }
++    }
++}

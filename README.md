@@ -30,6 +30,8 @@ reproducible source patches and a local health check. No credentials or chat his
 разрешении; результат копирования показан внизу (`codex-image-preview-mouse.patch`).
 При изменении размеров полноэкранная панель сохраняет прежний кадр до готовности
 нового: предварительная очистка экрана отключена (`codex-resize-no-flash.patch`).
+Подгрузка истории защищена от обратных и повторных границ ходов, вызывавших
+`slice index starts at … but ends at …` (`codex-history-pagination.patch`).
 
 Скрытие приложений по Dock/углу экрана обсуждалось, но **не реализовано**.
 
