@@ -27,6 +27,10 @@ if ! rg -q 'fn mouse_action' "$source_dir/codex-rs/tui/src/pager_overlay/image_p
     git -C "$source_dir" apply --check "$setup_dir/codex-image-preview-mouse.patch"
     git -C "$source_dir" apply "$setup_dir/codex-image-preview-mouse.patch"
 fi
+if ! rg -q 'fn resize_viewport_for_frame' "$source_dir/codex-rs/tui/src/tui.rs"; then
+    git -C "$source_dir" apply --check "$setup_dir/codex-resize-no-flash.patch"
+    git -C "$source_dir" apply "$setup_dir/codex-resize-no-flash.patch"
+fi
 # Cargo resolves the unused V8 host workspace member too. Its Git source recursively
 # fetches Chromium submodules. Use the identical checked-out source for metadata;
 # the CLI uses the official separately packaged code-mode host executable.
@@ -37,3 +41,4 @@ cargo +1.99.1 build --profile dev-small -p codex-cli --bin codex -j 6
 env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib image_click_preview -j 6
 env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib clipboard_paste::macos::tests -j 6
 env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib custom_terminal::tests -j 6
+env -u NO_COLOR cargo +1.99.1 test --profile dev-small -p codex-tui --lib resize_no_flash -j 6

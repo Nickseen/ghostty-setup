@@ -1,0 +1,113 @@
+diff --git a/codex-rs/tui/src/tui.rs b/codex-rs/tui/src/tui.rs
+--- a/codex-rs/tui/src/tui.rs
++++ b/codex-rs/tui/src/tui.rs
+@@ -192,6 +192,56 @@
+             NotificationCondition::Unfocused,
+             /*terminal_focused*/ false
+         ));
++    }
++
++    #[test]
++    fn resize_no_flash_fullscreen_keeps_previous_frame_until_replacement_is_ready() {
++        use ratatui::layout::Size;
++        use ratatui::widgets::{Paragraph, Widget};
++        let mut terminal = CustomTerminal::with_options(VT100Backend::new(40, 8)).unwrap();
++        terminal.set_viewport_area(Rect::new(0, 0, 40, 8));
++        terminal
++            .draw(|frame| {
++                Paragraph::new("Previous frame with image\nReadable while dragging")
++                    .render(frame.area(), frame.buffer_mut());
++            })
++            .unwrap();
++        for width in [32, 24, 38, 20, 40] {
++            let before = terminal.backend().vt100().screen().contents();
++            super::resize_viewport_for_frame(&mut terminal, Rect::new(0, 0, width, 8), true)
++                .unwrap();
++            assert_eq!(
++                terminal.backend().vt100().screen().contents(),
++                before,
++                "resize must not expose a blank screen before the replacement frame"
++            );
++            terminal
++                .draw_with_size(Size::new(width, 8), &mut Vec::new(), |frame| {
++                    Paragraph::new("New frame").render(frame.area(), frame.buffer_mut());
++                })
++                .unwrap();
++            let after = terminal.backend().vt100().screen().contents();
++            assert!(after.contains("New frame"));
++            assert!(
++                !after.contains("Readable"),
++                "replacement must erase stale rows"
++            );
++        }
++    }
++
++    #[test]
++    fn resize_no_flash_inline_still_clears_stale_shell_cells() {
++        let mut terminal = CustomTerminal::with_options(VT100Backend::new(20, 6)).unwrap();
++        terminal.set_viewport_area(Rect::new(0, 1, 20, 5));
++        write!(
++            terminal.backend_mut(),
++            "shell header\r\nstale prompt\r\nstale tail"
++        )
++        .unwrap();
++        super::resize_viewport_for_frame(&mut terminal, Rect::new(0, 1, 16, 5), false).unwrap();
++        let screen = terminal.backend().vt100().screen().contents();
++        assert!(screen.contains("shell header"));
++        assert!(!screen.contains("stale"));
+     }
+ 
+     #[test]
+@@ -762,6 +812,27 @@
+     terminal.clear_after_position(clear_position)
+ }
+ 
++/// Keep the last fullscreen frame visible while the next (possibly image-heavy)
++/// frame is being prepared. Resize can cancel tmux's synchronized-update mode,
++/// exposing any early clear before rendering has finished.
++fn resize_viewport_for_frame<B>(
++    terminal: &mut CustomTerminal<B>,
++    new_area: Rect,
++    owned_screen: bool,
++) -> Result<()>
++where
++    B: Backend<Error = io::Error> + Write,
++{
++    if !owned_screen {
++        clear_for_viewport_change(terminal, new_area)?;
++    }
++    terminal.set_viewport_area(new_area);
++    if owned_screen {
++        terminal.invalidate_viewport();
++    }
++    Ok(())
++}
++
+ impl Tui {
+     pub(crate) fn is_alt_screen_enabled(&self) -> bool {
+         self.alt_screen_enabled
+@@ -1415,7 +1486,13 @@
+ 
+         // Precompute any viewport updates that need a cursor-position query before entering
+         // the synchronized update, to avoid racing with the event reader.
+-        let mut pending_viewport_area = self.pending_viewport_area(screen_size)?;
++        let mut pending_viewport_area = if self.owned_screen {
++            // Fullscreen owns its origin. Inline cursor-position heuristics can
++            // incorrectly shift/clear the whole screen during a pane drag.
++            None
++        } else {
++            self.pending_viewport_area(screen_size)?
++        };
+ 
+         ensure_virtual_terminal_processing()?;
+ 
+@@ -1462,8 +1539,7 @@
+             if area != terminal.viewport_area {
+                 // On startup, the old viewport can still be empty. Clear from the
+                 // new viewport top so stale shell cells do not show through spaces.
+-                clear_for_viewport_change(terminal, area)?;
+-                terminal.set_viewport_area(area);
++                resize_viewport_for_frame(terminal, area, self.owned_screen)?;
+             }
+ 
+             Self::flush_pending_history_lines(
